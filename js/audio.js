@@ -1,6 +1,6 @@
 // Audio procedurale Web Audio API + Musica di Sottofondo Egiziana in loop per Maze Royale
 
-const BGM_SRC = './assets/bgm-egyptian.mp3?v=14';
+const BGM_SRC = './assets/bgm-egyptian.mp3?v=15';
 const BGM_VOLUME = 0.24; // Bilanciato sotto gli effetti spada/scudo/portale
 
 class MazeAudio {

@@ -3,7 +3,8 @@
 
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="mobile-web-app-capable" content="yes" />
@@ -12,12 +13,29 @@
   <title>Maze Royale — Dark Labyrinth</title>
   <link rel="manifest" href="./manifest.json" />
   <style>
-    html, body { background: #000; margin: 0; overflow: hidden; }
-    .hidden { display: none !important; }
-    #loading-screen { position: fixed; inset: 0; z-index: 150; background: #000; }
-    #game-canvas { visibility: hidden; }
+    html,
+    body {
+      background: #000;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    #loading-screen {
+      position: fixed;
+      inset: 0;
+      z-index: 150;
+      background: #000;
+    }
+
+    #game-canvas {
+      visibility: hidden;
+    }
   </style>
-  <link rel="stylesheet" href="./style.css?v=14" />
+  <link rel="stylesheet" href="./style.css?v=15" />
 </head>
 
 <body>
@@ -25,8 +43,8 @@
   <script>
     (function () {
       var isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
-      if (isLocal && 'serviceWorker' in navigator && navigator.serviceWorker.controller && !sessionStorage.getItem('sw_cleared_v14')) {
-        sessionStorage.setItem('sw_cleared_v14', '1');
+      if (isLocal && 'serviceWorker' in navigator && navigator.serviceWorker.controller && !sessionStorage.getItem('sw_cleared_v15')) {
+        sessionStorage.setItem('sw_cleared_v15', '1');
         navigator.serviceWorker.getRegistrations().then(function (regs) {
           Promise.all(regs.map(function (r) { return r.unregister(); })).then(function () {
             if (window.caches) {
@@ -46,7 +64,7 @@
 
   <!-- 1. Schermata di Caricamento Fullscreen (5s garantiti) -->
   <div id="loading-screen" class="loading-screen" aria-label="Caricamento in corso">
-    <img id="loading-bg" class="loading-bg" src="./assets/loading-bg.jpg?v=14" alt="Maze Royale Splash" />
+    <img id="loading-bg" class="loading-bg" src="./assets/loading-bg.jpg?v=15" alt="Maze Royale Splash" />
     <div class="loading-vignette"></div>
     <div class="loading-bar-wrap">
       <div class="loading-header">
@@ -64,26 +82,32 @@
   <main id="main-menu" class="main-menu hidden" aria-label="Menu Principale">
     <div class="menu-bg-blur"></div>
     <div class="menu-panel">
-      <div class="menu-tag">EDIZIONE ARCADE 3D</div>
+      <div class="menu-tag">EDIZIONE ARCADE 3D & DUELLO 1V1</div>
       <h1 class="menu-title">MAZE ROYALE</h1>
       <div class="menu-subtitle">DARK LABYRINTH</div>
       <p class="menu-desc">
-        Esplora il labirinto oscuro con la tua torcia, raccogli i 5 simboli segreti, respingi i guardiani e sblocca la
-        porta centrale.
+        Esplora il labirinto oscuro, trova i tuoi 5 simboli privati (o coopera in Co-op), combatti contro il Cubo Rosso
+        rivale e sblocca per primo la porta centrale!
       </p>
 
       <div class="menu-buttons">
-        <button id="btn-menu-single" type="button" class="menu-btn primary">
-          ⚔️ SINGLEPLAYER (5 LIVELLI)
+        <button id="btn-menu-duel-bot" type="button" class="menu-btn duel-bot">
+          ⚔️ 1 VS 1 — CONTRO BOT RIVALE
+        </button>
+        <button id="btn-menu-duel-online" type="button" class="menu-btn duel-online">
+          🔥 1 VS 1 ONLINE (CODICE)
         </button>
         <button id="btn-menu-coop" type="button" class="menu-btn coop">
           🤝 CO-OP CON CODICE
         </button>
-        <button id="btn-menu-multi" type="button" class="menu-btn secondary">
-          ⚙️ STANZA / IMPOSTAZIONI FIREBASE
+        <button id="btn-menu-single" type="button" class="menu-btn primary">
+          🏛️ SINGLEPLAYER (5 LIVELLI)
         </button>
         <button id="btn-menu-music" type="button" class="menu-btn secondary music-toggle-btn">
           🔊 MUSICA: ON
+        </button>
+        <button id="btn-menu-multi" type="button" class="menu-btn secondary">
+          ⚙️ STANZA / IMPOSTAZIONI FIREBASE
         </button>
       </div>
 
@@ -117,6 +141,12 @@
         <div class="hud-slot">3</div>
         <div class="hud-slot">4</div>
         <div class="hud-slot">5</div>
+      </div>
+      <div id="rival-hud" class="rival-hud hidden" aria-label="Stato Rivale">
+        <span id="rival-hud-label" class="rival-hud-label">🟥 RIVALE</span>
+        <span id="rival-hud-pages" class="rival-hud-pages">0/5</span>
+        <div class="rival-hp-track"><div id="rival-hp-fill" class="rival-hp-fill"></div></div>
+        <span id="rival-hud-state" class="rival-hud-state">100 HP</span>
       </div>
     </div>
 
@@ -167,6 +197,15 @@
     </div>
   </div>
 
+  <!-- Overlay Respawn Live 1v1 -->
+  <div id="respawn-overlay" class="respawn-overlay hidden">
+    <div class="respawn-card">
+      <div class="respawn-title">💀 ELIMINATO!</div>
+      <div id="respawn-sub" class="respawn-sub">I tuoi segnalini sono caduti — rientro allo Spawn...</div>
+      <div id="respawn-countdown" class="respawn-countdown">3</div>
+    </div>
+  </div>
+
   <!-- Schermata Rossa Game Over Arcade -->
   <div id="death-overlay" class="death-overlay hidden">
     <div class="death-title">SEI MORTO</div>
@@ -188,7 +227,8 @@
       <p class="modal-sub">La partita è sospesa. Premi <strong>ESC</strong> per riprendere o scegli un'opzione:</p>
       <div id="pause-coop-share" class="coop-section hidden">
         <div class="coop-label">CODICE STANZA: <span id="pause-coop-code">MR7K2</span></div>
-        <button id="btn-pause-share" type="button" class="ui-btn secondary coop-full-btn">📤 CONDIVIDI / COPIA LINK INVITO</button>
+        <button id="btn-pause-share" type="button" class="ui-btn secondary coop-full-btn">📤 CONDIVIDI / COPIA LINK
+          INVITO</button>
       </div>
       <div class="pause-actions">
         <button id="btn-pause-resume" type="button" class="ui-btn primary">▶ RIPRENDI</button>
@@ -199,35 +239,37 @@
     </div>
   </div>
 
-  <!-- Overlay Vittoria Campagna (5 Livelli Completati) -->
+  <!-- Overlay Vittoria Campagna / Fine Duello 1v1 -->
   <div id="victory-overlay" class="victory-overlay hidden">
-    <div class="victory-badge">🏆 CAMPAGNA COMPLETATA 🏆</div>
-    <h1 class="victory-title">LABIRINTO CONQUISTATO!</h1>
-    <p class="victory-sub">Tutti e 5 i livelli (fino a 45×45) sono stati superati!</p>
+    <div id="victory-badge" class="victory-badge">🏆 CAMPAGNA COMPLETATA 🏆</div>
+    <h1 id="victory-title" class="victory-title">LABIRINTO CONQUISTATO!</h1>
+    <p id="victory-sub" class="victory-sub">Tutti e 5 i livelli (fino a 45×45) sono stati superati!</p>
     <p id="victory-stats" class="death-stats"></p>
     <div class="death-actions">
+      <button id="btn-victory-next" type="button" class="ui-btn secondary death-btn hidden">⚔️ LIVELLO SUCCESSIVO</button>
       <button id="btn-victory-restart" type="button" class="ui-btn primary death-btn">⚔️ NUOVA PARTITA</button>
       <button id="btn-victory-menu" type="button" class="ui-btn death-btn">🏠 MENÙ PRINCIPALE</button>
     </div>
   </div>
 
-  <!-- Modale Co-Op con Codice Stanza -->
+  <!-- Modale Stanza con Codice (Co-Op o 1v1 Online) -->
   <div id="modal-coop" class="modal-backdrop hidden">
-    <div class="modal-card coop-card">
-      <h2>🤝 MODALITÀ CO-OP CON CODICE</h2>
-      <p class="modal-sub">
+    <div id="coop-modal-card" class="modal-card coop-card">
+      <h2 id="coop-modal-title">🤝 MODALITÀ CO-OP CON CODICE</h2>
+      <p id="coop-modal-sub" class="modal-sub">
         Condividi il codice con il tuo amico: i fogli raccolti sono condivisi tra entrambi e se uno sblocca il portale
         centrale avanzate insieme (5 livelli progressivi)!
       </p>
 
       <div class="coop-section">
-        <div class="coop-label">1. OSPITA PARTITA CO-OP (SPAWN A)</div>
+        <div id="coop-host-label" class="coop-label">1. OSPITA PARTITA CO-OP (SPAWN A)</div>
         <div class="coop-code-row">
           <div id="coop-host-code" class="coop-code-box">MR7K2P9Q</div>
           <button id="btn-coop-copy" type="button" class="ui-btn secondary">CODICE</button>
         </div>
-        <div id="coop-invite-link" class="coop-link-box" title="Link diretto Co-op"></div>
-        <button id="btn-coop-share" type="button" class="ui-btn secondary coop-full-btn">📤 CONDIVIDI / COPIA LINK INVITO</button>
+        <div id="coop-invite-link" class="coop-link-box" title="Link diretto stanza"></div>
+        <button id="btn-coop-share" type="button" class="ui-btn secondary coop-full-btn">📤 CONDIVIDI / COPIA LINK
+          INVITO</button>
         <button id="btn-coop-host" type="button" class="ui-btn primary coop-full-btn">🚀 CREA MONDO CO-OP</button>
       </div>
 
@@ -235,11 +277,12 @@
 
       <div class="coop-section">
         <label class="field-label">
-          2. ENTRA NEL MONDO DI UN AMICO (SPAWN B)
+          <span id="coop-join-label">2. ENTRA NEL MONDO DI UN AMICO (SPAWN B)</span>
           <input id="inp-coop-code" type="text" maxlength="240" placeholder="Codice (es. MR7K2P) o Link Invito"
             autocomplete="off" />
         </label>
-        <button id="btn-coop-join" type="button" class="ui-btn secondary coop-full-btn">🔑 ENTRA CON CODICE / LINK</button>
+        <button id="btn-coop-join" type="button" class="ui-btn secondary coop-full-btn">🔑 ENTRA CON CODICE /
+          LINK</button>
       </div>
 
       <div class="modal-actions">
@@ -313,7 +356,7 @@
     }
   </script>
   <script src="./vendor/peerjs.min.js"></script>
-  <script type="module" src="./js/main.js?v=14"></script>
+  <script type="module" src="./js/main.js?v=15"></script>
 </body>
 
 </html>

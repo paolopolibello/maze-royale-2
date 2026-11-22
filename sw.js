@@ -1,4 +1,4 @@
-const CACHE_NAME = 'maze-royale-v14';
+const CACHE_NAME = 'maze-royale-v15';
 const ASSETS = [
   './',
   './index.html',
@@ -19,6 +19,7 @@ const ASSETS = [
   './js/controls.js',
   './js/player.js',
   './js/entities.js',
+  './js/rival-bot.js',
   './js/network.js',
   './js/main.js'
 ];

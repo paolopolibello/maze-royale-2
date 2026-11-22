@@ -218,7 +218,7 @@ export class EnemyBot {
     scene.add(this.group);
   }
 
-  update(dt, maze, player, onAttackPlayer) {
+  update(dt, maze, player, onAttackPlayer, rivalTarget = null, onAttackRival = null) {
     if (!this.alive) {
       this.group.visible = false;
       this.visibleToPlayer = false;
@@ -232,23 +232,51 @@ export class EnemyBot {
       this.bodyMat.color.setHex(this.hurtFlash > 0 ? 0xfca5a5 : 0x22c55e);
     }
 
-    // Regola ferrea di visibilita': illuminato dalla torcia + Line of Sight senza muri!
-    const lit = player.alive && isIlluminatedWithLoS(maze, player.x, player.z, this.x, this.z, CONFIG.TORCH_RANGE);
-    this.visibleToPlayer = lit;
-    this.group.visible = lit;
-    this.aware = lit;
+    // Regola ferrea di visibilita': illuminato dalla torcia del giocatore + Line of Sight senza muri!
+    const playerLit = player.alive && isIlluminatedWithLoS(maze, player.x, player.z, this.x, this.z, CONFIG.TORCH_RANGE);
+    this.visibleToPlayer = playerLit;
+    this.group.visible = playerLit;
+
+    const rivalLit = Boolean(
+      rivalTarget &&
+      rivalTarget.alive &&
+      isIlluminatedWithLoS(maze, rivalTarget.x, rivalTarget.z, this.x, this.z, CONFIG.TORCH_RANGE * 0.78)
+    );
+
+    const dPlayer = playerLit ? Math.hypot(player.x - this.x, player.z - this.z) : Infinity;
+    const dRival = rivalLit ? Math.hypot(rivalTarget.x - this.x, rivalTarget.z - this.z) : Infinity;
+
+    let chaseTarget = null;
+    let chaseAttackCb = null;
+    if (playerLit && rivalLit) {
+      if (dPlayer <= dRival) {
+        chaseTarget = player;
+        chaseAttackCb = onAttackPlayer;
+      } else {
+        chaseTarget = rivalTarget;
+        chaseAttackCb = onAttackRival;
+      }
+    } else if (playerLit) {
+      chaseTarget = player;
+      chaseAttackCb = onAttackPlayer;
+    } else if (rivalLit) {
+      chaseTarget = rivalTarget;
+      chaseAttackCb = onAttackRival;
+    }
+
+    this.aware = Boolean(chaseTarget);
 
     let vx = 0;
     let vz = 0;
-    const dist = Math.hypot(player.x - this.x, player.z - this.z);
+    const dist = chaseTarget ? Math.hypot(chaseTarget.x - this.x, chaseTarget.z - this.z) : Infinity;
 
     if (this.stunTimer <= 0) {
-      if (this.aware && dist > 1.25) {
-        vx = ((player.x - this.x) / dist) * CONFIG.BOT_SPEED;
-        vz = ((player.z - this.z) / dist) * CONFIG.BOT_SPEED;
+      if (this.aware && chaseTarget && dist > 1.25) {
+        vx = ((chaseTarget.x - this.x) / dist) * CONFIG.BOT_SPEED;
+        vz = ((chaseTarget.z - this.z) / dist) * CONFIG.BOT_SPEED;
         this.rotY = Math.atan2(vx, vz);
       } else if (!this.aware) {
-        // Lento pattugliamento cieco nei corridoi (non conosce la posizione del giocatore nel buio!)
+        // Lento pattugliamento cieco nei corridoi (non conosce la posizione dei giocatori nel buio!)
         this.patrolTimer -= dt;
         if (this.patrolTimer <= 0) {
           this.patrolAngle += (Math.random() - 0.5) * 2.4;
@@ -289,10 +317,10 @@ export class EnemyBot {
       this.knockVz = 0;
     }
 
-    if (this.aware && this.stunTimer <= 0 && dist <= 1.85 && this.attackCooldown <= 0) {
+    if (this.aware && chaseTarget && this.stunTimer <= 0 && dist <= 1.85 && this.attackCooldown <= 0) {
       this.attackCooldown = CONFIG.BOT_ATTACK_COOLDOWN;
-      if (typeof onAttackPlayer === 'function') {
-        onAttackPlayer(CONFIG.BOT_DAMAGE, this);
+      if (typeof chaseAttackCb === 'function') {
+        chaseAttackCb(CONFIG.BOT_DAMAGE, this);
       }
     }
 

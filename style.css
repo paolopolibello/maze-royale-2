@@ -135,7 +135,7 @@ html, body {
   padding: 16px;
   overflow-y: auto;
   touch-action: pan-y;
-  background: #05050a url('./assets/loading-bg.jpg?v=14') center / cover no-repeat;
+  background: #05050a url('./assets/loading-bg.jpg?v=15') center / cover no-repeat;
 }
 
 .menu-bg-blur {
@@ -232,6 +232,20 @@ html, body {
   background: linear-gradient(135deg, #9333ea, #6d28d9);
   border-color: #fde047;
   box-shadow: 0 8px 24px rgba(147, 51, 234, 0.48);
+}
+
+.menu-btn.duel-bot {
+  background: linear-gradient(135deg, #dc2626, #991b1b);
+  border-color: #fca5a5;
+  box-shadow: 0 8px 24px rgba(220, 38, 38, 0.48);
+}
+
+.menu-btn.duel-online {
+  background: linear-gradient(135deg, #b91c1c, #c2410c);
+  border-color: #fbbf24;
+  box-shadow: 0 8px 22px rgba(185, 28, 28, 0.42);
+  font-size: 16px;
+  padding: 13px 18px;
 }
 
 .menu-btn.coop {
@@ -416,6 +430,112 @@ html, body {
   background: rgba(234, 179, 8, 0.18);
   color: #fef08a;
   box-shadow: 0 0 12px rgba(250, 204, 21, 0.25);
+}
+
+/* Barra stato Rivale 1v1 */
+.rival-hud {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(18, 8, 12, 0.86);
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 800;
+  color: #fecaca;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
+}
+
+.rival-hud-label {
+  color: #f87171;
+  letter-spacing: 0.04em;
+}
+
+.rival-hud-pages {
+  background: rgba(239, 68, 68, 0.22);
+  border: 1px solid rgba(252, 165, 165, 0.45);
+  color: #fef08a;
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+
+.rival-hp-track {
+  width: 68px;
+  height: 8px;
+  background: #1e1b2e;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.rival-hp-fill {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, #991b1b, #ef4444);
+  transition: width 0.12s linear;
+}
+
+.rival-hud-state {
+  color: #fde68a;
+  min-width: 48px;
+  text-align: right;
+}
+
+.rival-hud.portal-alert {
+  border-color: #fde047;
+  box-shadow: 0 0 18px rgba(239, 68, 68, 0.78);
+  animation: portalAlertPulse 0.6s ease-in-out infinite alternate;
+}
+
+@keyframes portalAlertPulse {
+  from { transform: scale(1); background: rgba(127, 29, 29, 0.88); }
+  to { transform: scale(1.04); background: rgba(185, 28, 28, 0.94); }
+}
+
+/* Overlay Respawn Live 1v1 */
+.respawn-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(127, 29, 29, 0.52);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  pointer-events: none;
+  backdrop-filter: blur(2px);
+}
+
+.respawn-card {
+  background: rgba(15, 23, 42, 0.92);
+  border: 2px solid #ef4444;
+  border-radius: 16px;
+  padding: 20px 28px;
+  text-align: center;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.85);
+}
+
+.respawn-title {
+  font-size: 28px;
+  font-weight: 900;
+  color: #fecaca;
+  letter-spacing: 0.08em;
+}
+
+.respawn-sub {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #e2e8f0;
+}
+
+.respawn-countdown {
+  margin-top: 10px;
+  font-family: ui-monospace, monospace;
+  font-size: 46px;
+  font-weight: 900;
+  color: #fde047;
 }
 
 .net-pill {
@@ -641,7 +761,7 @@ html, body {
   backdrop-filter: blur(4px);
 }
 
-/* Schermata Vittoria Campagna (5 Livelli) */
+/* Schermata Vittoria / Sconfitta (Campagna o Duello 1v1) */
 .victory-overlay {
   position: fixed;
   inset: 0;
@@ -655,6 +775,24 @@ html, body {
   gap: 12px;
   padding: 20px;
   backdrop-filter: blur(5px);
+}
+
+.victory-overlay.defeat-theme {
+  background: radial-gradient(circle at 50% 42%, rgba(153, 27, 27, 0.86) 0%, rgba(2, 6, 23, 0.95) 75%);
+}
+
+.victory-overlay.defeat-theme .victory-badge {
+  color: #fecaca;
+  background: rgba(220, 38, 38, 0.24);
+  border-color: rgba(248, 113, 113, 0.65);
+}
+
+.victory-overlay.defeat-theme .victory-title {
+  color: #fecaca;
+}
+
+.victory-overlay.defeat-theme .victory-sub {
+  color: #fee2e2;
 }
 
 .victory-badge {
@@ -762,6 +900,22 @@ html, body {
 
 .coop-card {
   border-color: rgba(45, 212, 191, 0.65);
+}
+
+.coop-card.duel-mode {
+  border-color: rgba(239, 68, 68, 0.78);
+}
+
+.coop-card.duel-mode h2 {
+  color: #fca5a5;
+}
+
+.coop-card.duel-mode .coop-label {
+  color: #fca5a5;
+}
+
+.coop-card.duel-mode .coop-code-box {
+  border-color: #ef4444;
 }
 
 .coop-section {
@@ -957,9 +1111,12 @@ html, body {
   .menu-panel { padding: 16px 16px; gap: 8px; }
   .menu-title { font-size: clamp(26px, 5.5vw, 40px); }
   .menu-btn { padding: 11px 14px; font-size: 15px; }
-  .menu-btn.coop { padding: 10px 14px; font-size: 14px; }
+  .menu-btn.coop,
+  .menu-btn.duel-online { padding: 10px 14px; font-size: 14px; }
   .hp-card { min-width: 140px; padding: 5px 8px; }
   .hud-slot { width: 30px; height: 34px; font-size: 15px; }
+  .rival-hud { gap: 5px; padding: 2px 9px; font-size: 10px; }
+  .rival-hp-track { width: 48px; }
   .net-pill { display: none; }
   #action-cluster { gap: 8px; }
   .act-btn { width: 60px; height: 60px; }

@@ -21,6 +21,8 @@ export class RealtimeNetwork {
     this.roomId = 'solo';
     this.mode = 'local'; // 'local' | 'p2p' | 'firebase'
     this.coopRole = 'host'; // 'host' | 'guest' | 'solo'
+    this.maxPeers = 0; // 0 = illimitati (Co-op), 1 = 1v1 stretto
+    this.modeLabel = 'CO-OP';
     this.statusLabel = 'Singleplayer';
     this.remotePlayers = new Map();
 
@@ -43,11 +45,21 @@ export class RealtimeNetwork {
   }
 
   _storageKey(room) {
-    return `maze_royale_room_snapshot_${room}`;
+    return `maze_royale_2_room_snapshot_${room}`;
   }
 
   _hostPeerId(room) {
-    return `mazeroyale-v11-${String(room || '').toLowerCase()}`;
+    return `mazeroyale2-v15-${String(room || '').toLowerCase()}`;
+  }
+
+  _getDistinctPeerIds() {
+    const ids = new Set();
+    for (const c of this.peerConns) {
+      if (!c || c.open === false) continue;
+      const pid = c.peer || c._remotePid;
+      if (pid) ids.add(pid);
+    }
+    return ids;
   }
 
   saveLocalSnapshot(snapshot) {
@@ -69,10 +81,12 @@ export class RealtimeNetwork {
     return null;
   }
 
-  async connect(roomId = 'labyrinth-1', role = 'solo') {
+  async connect(roomId = 'labyrinth-1', role = 'solo', opts = {}) {
     this.disconnect();
     const myToken = this._sessionToken;
     this.coopRole = role;
+    this.maxPeers = Number(opts.maxPeers) || 0;
+    this.modeLabel = opts.modeLabel || 'CO-OP';
     const cleanRoom = String(roomId || 'labyrinth-1').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24) || '1000';
     this.roomId = cleanRoom;
 
@@ -98,11 +112,11 @@ export class RealtimeNetwork {
 
   _connectLocalAndP2P(myToken) {
     this.mode = 'local';
-    this.statusLabel = `CO-OP (${this.roomId})`;
+    this.statusLabel = `${this.modeLabel} (${this.roomId})`;
     this.handlers.onStatusChange?.(this.statusLabel, this.mode);
 
     if (typeof BroadcastChannel !== 'undefined') {
-      this.channel = new BroadcastChannel(`maze_royale_${this.roomId}`);
+      this.channel = new BroadcastChannel(`maze_royale_2_${this.roomId}`);
       this.channel.onmessage = (ev) => this._handlePeerMessage(ev.data, null);
       this.channel.postMessage({ type: 'HELLO', from: this.playerId, role: this.coopRole, at: Date.now() });
     }
@@ -117,6 +131,27 @@ export class RealtimeNetwork {
     if (typeof window !== 'undefined' && typeof window.Peer === 'function') {
       this._initPeerJS(myToken);
     }
+  }
+
+  _onIncomingConnection(conn, myToken) {
+    if (myToken !== this._sessionToken) {
+      try { conn.close(); } catch (_) {}
+      return;
+    }
+    if (this.maxPeers > 0) {
+      const peers = this._getDistinctPeerIds();
+      const incomingPeer = conn?.peer;
+      if (peers.size >= this.maxPeers && (!incomingPeer || !peers.has(incomingPeer))) {
+        const rejectConn = () => {
+          try { conn.send({ type: 'ROOM_FULL', from: this.playerId }); } catch (_) {}
+          setTimeout(() => { try { conn.close(); } catch (_) {} }, 50);
+        };
+        if (conn.open) rejectConn();
+        else conn.on?.('open', rejectConn);
+        return;
+      }
+    }
+    this._attachDataConn(conn, myToken);
   }
 
   _initPeerJS(myToken, hostRetries = 0) {
@@ -136,16 +171,12 @@ export class RealtimeNetwork {
 
       peer.on('open', () => {
         if (myToken !== this._sessionToken) return;
-        this.statusLabel = `CO-OP Link (${this.roomId})`;
+        this.statusLabel = `${this.modeLabel} Link (${this.roomId})`;
         this.handlers.onStatusChange?.(this.statusLabel, 'p2p');
       });
 
       peer.on('connection', (conn) => {
-        if (myToken !== this._sessionToken) {
-          try { conn.close(); } catch (_) {}
-          return;
-        }
-        this._attachDataConn(conn, myToken);
+        this._onIncomingConnection(conn, myToken);
       });
 
       peer.on('error', (err) => {
@@ -157,7 +188,7 @@ export class RealtimeNetwork {
           this._retryTimer = setTimeout(() => this._initPeerJS(myToken, hostRetries + 1), 1400);
           return;
         }
-        this.statusLabel = `CO-OP Locale (${this.roomId})`;
+        this.statusLabel = `${this.modeLabel} Locale (${this.roomId})`;
         this.handlers.onStatusChange?.(this.statusLabel, 'local');
       });
     } else if (this.coopRole === 'guest') {
@@ -230,7 +261,7 @@ export class RealtimeNetwork {
       if (isPosChannel) return;
 
       clearTimeout(this._retryTimer);
-      this.statusLabel = `CO-OP Online (${this.roomId})`;
+      this.statusLabel = `${this.modeLabel} Online (${this.roomId})`;
       this.handlers.onStatusChange?.(this.statusLabel, 'p2p');
 
       try {
@@ -306,6 +337,23 @@ export class RealtimeNetwork {
   _handlePeerMessage(msg, sourceConn = null) {
     if (!msg || msg.from === this.playerId) return;
 
+    if (msg.type === 'ROOM_FULL') {
+      if (!msg.targetId || msg.targetId === this.playerId) {
+        this.handlers.onRoomFull?.(msg);
+      }
+      return;
+    }
+
+    // BroadcastChannel: limita anche via tab locali in modalita' 1v1
+    if (!sourceConn && this.coopRole === 'host' && this.maxPeers > 0 && msg.type === 'HELLO') {
+      if (this.remotePlayers.size >= this.maxPeers && !this.remotePlayers.has(msg.from)) {
+        try {
+          this.channel?.postMessage({ type: 'ROOM_FULL', from: this.playerId, targetId: msg.from });
+        } catch (_) {}
+        return;
+      }
+    }
+
     // Se l'host ha piu' peer connessi, inoltra i messaggi P2P agli altri peer sul canale giusto
     if (sourceConn && this.coopRole === 'host') {
       if (msg.type === 'STATE') {
@@ -314,7 +362,7 @@ export class RealtimeNetwork {
             try { conn.send(msg); } catch (_) {}
           }
         }
-      } else if (['PAGE_EVENT', 'CHEST_OPENED', 'LEVEL_ADVANCE', 'BYE'].includes(msg.type)) {
+      } else if (['PAGE_EVENT', 'CHEST_OPENED', 'LEVEL_ADVANCE', 'DUEL_WIN', 'DUEL_RESET', 'HIT', 'HIT_RESULT', 'BYE'].includes(msg.type)) {
         for (const conn of this.peerConns) {
           if (conn !== sourceConn && conn.open && conn.label !== 'pos') {
             try { conn.send(msg); } catch (_) {}
@@ -345,6 +393,16 @@ export class RealtimeNetwork {
         this.processedHits.add(msg.hitId);
         this.handlers.onIncomingHit?.(msg);
       }
+    } else if (msg.type === 'HIT_RESULT' && msg.targetId === this.playerId) {
+      const rk = `hr_${msg.eid || msg.hitId || Date.now()}`;
+      if (!this.processedEvents.has(rk)) {
+        this.processedEvents.add(rk);
+        this.handlers.onHitResult?.(msg);
+      }
+    } else if (msg.type === 'DUEL_WIN') {
+      this.handlers.onDuelWin?.(msg);
+    } else if (msg.type === 'DUEL_RESET') {
+      this.handlers.onDuelReset?.(msg);
     } else if (msg.type === 'PAGE_EVENT') {
       this.handlers.onPageEvent?.(msg.event);
     } else if (msg.type === 'CHEST_OPENED') {
@@ -366,7 +424,7 @@ export class RealtimeNetwork {
     this.fbApi = dbMod;
     this.fbDb = db;
     this.mode = 'firebase';
-    this.statusLabel = `CO-OP Online (${this.roomId})`;
+    this.statusLabel = `${this.modeLabel} Online (${this.roomId})`;
     this.handlers.onStatusChange?.(this.statusLabel, this.mode);
 
     const base = `rooms/${this.roomId}`;
@@ -412,11 +470,36 @@ export class RealtimeNetwork {
       })
     );
 
+    const myHitResRef = dbMod.ref(db, `${base}/hitResults/${this.playerId}`);
+    this.unsubFns.push(
+      dbMod.onValue(myHitResRef, (snap) => {
+        const resMap = snap.val();
+        if (!resMap) return;
+        for (const [eid, payload] of Object.entries(resMap)) {
+          const rk = `hr_${eid}`;
+          if (this.processedEvents.has(rk)) continue;
+          this.processedEvents.add(rk);
+          this.handlers.onHitResult?.(payload);
+          dbMod.remove(dbMod.ref(db, `${base}/hitResults/${this.playerId}/${eid}`)).catch(() => null);
+        }
+      })
+    );
+
     const metaRef = dbMod.ref(db, `${base}/meta`);
     this.unsubFns.push(
       dbMod.onValue(metaRef, (snap) => {
         const meta = snap.val();
         if (!meta) return;
+        if (meta.duelWinner && meta.duelWinner.winnerId !== this.playerId && !this.processedEvents.has(`dw_${meta.duelWinner.eventId}`)) {
+          this.processedEvents.add(`dw_${meta.duelWinner.eventId}`);
+          this.handlers.onDuelWin?.(meta.duelWinner);
+          return;
+        }
+        if (meta.resetId && meta.resetFrom !== this.playerId && !this.processedEvents.has(`dr_${meta.resetId}`)) {
+          this.processedEvents.add(`dr_${meta.resetId}`);
+          this.handlers.onDuelReset?.({ level: meta.level, seed: meta.seed });
+          return;
+        }
         if (meta.victory && !this.processedEvents.has(`vic_${meta.eventId}`)) {
           this.processedEvents.add(`vic_${meta.eventId}`);
           this.handlers.onLevelAdvance?.(meta.level, meta.seed, meta.winnerName, true);
@@ -519,6 +602,62 @@ export class RealtimeNetwork {
       set(ref(this.fbDb, `rooms/${this.roomId}/hits/${targetId}/${hitId}`), payload).catch(() => null);
     } else {
       this._broadcastLocalAndP2P({ type: 'HIT', from: this.playerId, ...payload });
+    }
+  }
+
+  sendHitResult(targetId, result = {}) {
+    if (this.coopRole === 'solo') return;
+    const eid = `${this.playerId}_hr_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+    const payload = { ...result, eid, targetId, fromId: this.playerId, at: Date.now() };
+    if (this.mode === 'firebase' && this.fbDb) {
+      const { ref, set } = this.fbApi;
+      set(ref(this.fbDb, `rooms/${this.roomId}/hitResults/${targetId}/${eid}`), payload).catch(() => null);
+    } else {
+      this._broadcastLocalAndP2P({ type: 'HIT_RESULT', from: this.playerId, ...payload });
+    }
+  }
+
+  publishDuelWin(level, winnerName, winnerPages = 5, winnerKills = 0) {
+    if (this.coopRole === 'solo') return;
+    const eventId = `${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+    const duelWinner = {
+      winnerId: this.playerId,
+      winnerName,
+      winnerPages,
+      winnerKills,
+      level,
+      eventId
+    };
+    if (this.mode === 'firebase' && this.fbDb) {
+      const { ref, set } = this.fbApi;
+      const baseSnap = this._lastSnapshot || { level, seed: 0, gameMode: 'duel_online', collectedPages: [], openedChests: [] };
+      set(ref(this.fbDb, `rooms/${this.roomId}/meta`), { ...baseSnap, duelWinner, updatedAt: Date.now() }).catch(() => null);
+    } else {
+      this._broadcastLocalAndP2P({ type: 'DUEL_WIN', from: this.playerId, ...duelWinner });
+    }
+  }
+
+  publishDuelReset(level, seed) {
+    if (this.coopRole === 'solo') return;
+    const resetId = `${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+    const snapshot = {
+      level,
+      seed,
+      gameMode: 'duel_online',
+      collectedPages: [],
+      openedChests: [],
+      victory: false,
+      duelWinner: null,
+      resetId,
+      resetFrom: this.playerId
+    };
+    this._lastSnapshot = snapshot;
+    this.saveLocalSnapshot(snapshot);
+    if (this.mode === 'firebase' && this.fbDb) {
+      const { ref, set } = this.fbApi;
+      set(ref(this.fbDb, `rooms/${this.roomId}/meta`), { ...snapshot, updatedAt: Date.now() }).catch(() => null);
+    } else {
+      this._broadcastLocalAndP2P({ type: 'DUEL_RESET', from: this.playerId, level, seed });
     }
   }
 

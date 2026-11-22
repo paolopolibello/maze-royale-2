@@ -29,7 +29,7 @@ export function createXRayMaterial(colorHex, opacity = 0.48) {
 }
 
 export class PlayerCube {
-  constructor(id, name = 'TU', colorHex = 0x3b82f6) {
+  constructor(id, name = 'TU', colorHex = 0x2563eb) {
     this.id = id;
     this.name = name;
     this.x = 0;
@@ -42,6 +42,8 @@ export class PlayerCube {
     this.swordDamage = CONFIG.BASE_SWORD_DAMAGE;
     this.alive = true;
     this.respawnTimer = 0;
+    this.knockVx = 0;
+    this.knockVz = 0;
 
     this.shieldActive = false;
     this.dashTimer = 0;
@@ -76,10 +78,10 @@ export class PlayerCube {
     this.bodyMesh.renderOrder = 1;
     this.group.add(this.bodyMesh);
 
-    // 2. Faccia frontale (+Z locale!): sempre visibile rossa di base, blu ciano quando lo Scudo e' tenuto premuto
+    // 2. Faccia frontale (+Z locale!): blu ghiaccio di base, blu ciano brillante quando lo Scudo e' tenuto premuto
     const frontGeo = new THREE.BoxGeometry(s * 0.82, s * 0.68, 0.14);
     this.frontMat = new THREE.MeshBasicMaterial({
-      color: 0xff2b2b
+      color: 0xbfdbfe
     });
     this.frontFaceMesh = new THREE.Mesh(frontGeo, this.frontMat);
     this.frontFaceMesh.position.set(0, half + 0.04, half + 0.03);
@@ -102,7 +104,7 @@ export class PlayerCube {
 
     // 4. Silhouette X-Ray che "buca" i muri (renderOrder = 50 dopo tutti i muri opachi)
     const xrayGeo = new THREE.BoxGeometry(s * 1.002, s * 1.002, s * 1.002);
-    this.xrayMat = createXRayMaterial(0xff6b35, 0.55);
+    this.xrayMat = createXRayMaterial(0x60a5fa, 0.55);
     this.xrayMesh = new THREE.Mesh(xrayGeo, this.xrayMat);
     this.xrayMesh.position.y = half;
     this.xrayMesh.renderOrder = 50;
@@ -170,9 +172,19 @@ export class PlayerCube {
     this.respawnTimer = 0;
     this.dashTimer = 0;
     this.attackTimer = 0;
+    this.knockVx = 0;
+    this.knockVz = 0;
     this.shieldActive = false;
     this.group.visible = true;
     this.syncTransform();
+  }
+
+  applyKnockback(pushDirX, pushDirZ, speed = CONFIG.PLAYER_KNOCKBACK_SPEED) {
+    const pLen = Math.hypot(pushDirX, pushDirZ);
+    if (pLen > 1e-4) {
+      this.knockVx = (pushDirX / pLen) * speed;
+      this.knockVz = (pushDirZ / pLen) * speed;
+    }
   }
 
   syncTransform() {
@@ -217,9 +229,9 @@ export class PlayerCube {
       this.shieldPlate.visible = true;
       this.xrayMat.color.setHex(0x38bdf8);
     } else {
-      this.frontMat.color.setHex(0xff2b2b);
+      this.frontMat.color.setHex(0xbfdbfe);
       this.shieldPlate.visible = false;
-      this.xrayMat.color.setHex(0xff6b35);
+      this.xrayMat.color.setHex(0x60a5fa);
     }
 
     // Scatto / Dash in avanti lungo `rotY`
@@ -256,7 +268,7 @@ export class PlayerCube {
       this.slashGroup.visible = false;
     }
 
-    // Calcolo spostamento e risoluzione rigorosa Circle-vs-AABB
+    // Calcolo spostamento, rinculo e risoluzione rigorosa Circle-vs-AABB
     let targetX = this.x;
     let targetZ = this.z;
 
@@ -271,9 +283,22 @@ export class PlayerCube {
       targetZ += (input.moveZ / moveMag) * clampedMag * speed * dt;
     }
 
+    targetX += this.knockVx * dt;
+    targetZ += this.knockVz * dt;
+
     const resolved = resolveMazeCollision(maze, this.x, this.z, targetX, targetZ, CONFIG.PLAYER_RADIUS);
     this.x = resolved.x;
     this.z = resolved.z;
+
+    if (Math.abs(this.knockVx) > 0.05 || Math.abs(this.knockVz) > 0.05) {
+      const damp = Math.exp(-CONFIG.PLAYER_KNOCKBACK_FRICTION * dt);
+      this.knockVx *= damp;
+      this.knockVz *= damp;
+    } else {
+      this.knockVx = 0;
+      this.knockVz = 0;
+    }
+
     this.syncTransform();
 
     return activeHitbox;
@@ -293,6 +318,8 @@ export class PlayerCube {
       this.alive = false;
       this.respawnTimer = autoRespawn ? CONFIG.RESPAWN_SECONDS : -1;
       this.shieldActive = false;
+      this.knockVx = 0;
+      this.knockVz = 0;
       this.slashGroup.visible = false;
       this.group.visible = false;
       audio.playDeath();

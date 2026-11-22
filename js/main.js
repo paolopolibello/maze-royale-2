@@ -1,28 +1,35 @@
 import * as THREE from '../vendor/three.module.js';
 import { CONFIG } from './config.js';
 import { generateSymmetricMaze } from './maze.js';
+import { resolveMazeCollision } from './collision.js';
 import { createSandstoneWallTexture, createFloorTexture, createChestTexture } from './textures.js';
 import { PlayerCube, createXRayMaterial, getForwardAttackCenter } from './player.js';
 import { WorldPage, LootChest, CenterDoor, EnemyBot } from './entities.js';
+import { RivalBot } from './rival-bot.js';
 import { GameControls } from './controls.js';
-import { isIlluminatedWithLoS } from './visibility.js';
+import { hasLineOfSight, isIlluminatedWithLoS } from './visibility.js';
 import { RealtimeNetwork, stepInterpolatedPose } from './network.js';
 import { loadFirebaseConfig, saveFirebaseConfig } from './firebase-config.js';
 import { audio } from './audio.js';
 
 /**
- * Rappresentazione visiva di un giocatore avversario multiplayer (PvP / Co-op).
+ * Rappresentazione visiva di un giocatore avversario/compagno multiplayer (Co-op ciano o 1v1 Rosso).
  * Rispetta rigorosamente lo stesso sistema X-Ray + invisibilita' totale nel buio e dietro i muri.
  */
 class RemotePlayerVisual {
   constructor(id, scene, isCoop = true) {
     this.id = id;
+    this.isCoop = isCoop;
     this.group = new THREE.Group();
     const s = CONFIG.PLAYER_SIZE;
     const half = s * 0.5;
-    const bodyHex = isCoop ? 0x06b6d4 : 0xf59e0b;
-    const frontHex = isCoop ? 0x22d3ee : 0xef4444;
+    const bodyHex = isCoop ? 0x06b6d4 : 0xdc2626;
+    const frontHex = isCoop ? 0x22d3ee : 0xfca5a5;
+    const xrayHex = isCoop ? 0x06b6d4 : 0xef4444;
+    this.defaultBodyHex = bodyHex;
     this.defaultFrontHex = frontHex;
+    this._lastHp = null;
+    this._hurtFlash = 0;
 
     this.bodyMat = new THREE.MeshStandardMaterial({ color: bodyHex, roughness: 0.45 });
     const body = new THREE.Mesh(new THREE.BoxGeometry(s, s, s), this.bodyMat);
@@ -36,19 +43,65 @@ class RemotePlayerVisual {
     front.renderOrder = 1;
     this.group.add(front);
 
-    this.slashMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(2.15, 0.18, 0.42),
-      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 })
+    // Scudo frontale traslucido
+    this.shieldPlate = new THREE.Mesh(
+      new THREE.BoxGeometry(s * 1.16, s * 1.08, 0.12),
+      new THREE.MeshBasicMaterial({
+        color: 0x38bdf8,
+        transparent: true,
+        opacity: 0.46,
+        depthWrite: false
+      })
     );
-    this.slashMesh.position.set(0, half + 0.05, CONFIG.ATTACK_OFFSET_Z);
-    this.slashMesh.visible = false;
-    this.group.add(this.slashMesh);
+    this.shieldPlate.position.set(0, half + 0.02, half + 0.24);
+    this.shieldPlate.visible = false;
+    this.shieldPlate.renderOrder = 12;
+    this.group.add(this.shieldPlate);
 
-    this.xrayMat = createXRayMaterial(bodyHex, 0.52);
+    // Fendente spada completo (arco + barra)
+    this.slashGroup = new THREE.Group();
+    this.slashGroup.position.set(0, half + 0.05, CONFIG.ATTACK_OFFSET_Z);
+    const bladeGeo = new THREE.RingGeometry(0.45, 1.52, 16, 1, -Math.PI * 0.72, Math.PI * 1.44);
+    bladeGeo.rotateX(-Math.PI * 0.5);
+    const slashMat = new THREE.MeshBasicMaterial({
+      color: isCoop ? 0xffffff : 0xffe4e6,
+      transparent: true,
+      opacity: 0.92,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    });
+    this.slashGroup.add(new THREE.Mesh(bladeGeo, slashMat));
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(2.15, 0.18, 0.42), slashMat);
+    bar.position.z = 0.22;
+    this.slashGroup.add(bar);
+    this.slashGroup.visible = false;
+    this.slashGroup.renderOrder = 20;
+    this.group.add(this.slashGroup);
+
+    this.xrayMat = createXRayMaterial(xrayHex, 0.54);
     const xray = new THREE.Mesh(new THREE.BoxGeometry(s * 1.002, s * 1.002, s * 1.002), this.xrayMat);
     xray.position.y = half;
     xray.renderOrder = 50;
     this.group.add(xray);
+
+    // Barra HP 3D sopra il cubo (visibile nel duello 1v1 quando illuminato)
+    this.hpBarBg = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.24, 0.18),
+      new THREE.MeshBasicMaterial({ color: 0x1e1b2e, side: THREE.DoubleSide })
+    );
+    this.hpBarBg.position.set(0, s + 0.52, 0);
+    this.hpBarBg.rotation.x = -Math.PI * 0.22;
+    this.hpBarBg.visible = !isCoop;
+    this.group.add(this.hpBarBg);
+
+    this.hpBarFill = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.18, 0.13),
+      new THREE.MeshBasicMaterial({ color: isCoop ? 0x22c55e : 0xef4444, side: THREE.DoubleSide })
+    );
+    this.hpBarFill.position.set(0, s + 0.525, 0.01);
+    this.hpBarFill.rotation.x = -Math.PI * 0.22;
+    this.hpBarFill.visible = !isCoop;
+    this.group.add(this.hpBarFill);
 
     this.group.visible = false;
     this.smoothPose = {
@@ -67,12 +120,35 @@ class RemotePlayerVisual {
     scene.add(this.group);
   }
 
+  getWorldPosition() {
+    if (!this.smoothPose.initialized) return null;
+    return { x: this.smoothPose.x, z: this.smoothPose.z };
+  }
+
   sync(dt, data, maze, localPlayer) {
     if (!data || !data.alive) {
       this.group.visible = false;
       this.smoothPose.initialized = false;
+      this._lastHp = data ? data.hp : null;
       return;
     }
+
+    if (typeof data.hp === 'number') {
+      if (this._lastHp !== null && data.hp < this._lastHp) {
+        this._hurtFlash = 0.14;
+      }
+      this._lastHp = data.hp;
+      const maxHp = Math.max(1, data.maxHp || CONFIG.PLAYER_MAX_HP);
+      const hpPct = Math.max(0.02, Math.min(1, data.hp / maxHp));
+      this.hpBarFill.scale.x = hpPct;
+      this.hpBarFill.position.x = -(1 - hpPct) * 0.59;
+    }
+
+    if (this._hurtFlash > 0) {
+      this._hurtFlash = Math.max(0, this._hurtFlash - dt);
+      this.bodyMat.color.setHex(this._hurtFlash > 0 ? 0xffffff : this.defaultBodyHex);
+    }
+
     stepInterpolatedPose(this.smoothPose, data, dt);
     const sx = this.smoothPose.x;
     const sz = this.smoothPose.z;
@@ -80,8 +156,9 @@ class RemotePlayerVisual {
     this.group.visible = visible;
     this.group.position.set(sx, 0, sz);
     this.group.rotation.y = this.smoothPose.rotY;
+    this.shieldPlate.visible = Boolean(data.shieldActive);
     this.frontMat.color.setHex(data.shieldActive ? 0x38bdf8 : this.defaultFrontHex);
-    this.slashMesh.visible = Boolean(data.attacking);
+    this.slashGroup.visible = Boolean(data.attacking);
   }
 
   dispose(scene) {
@@ -99,11 +176,18 @@ class MazeRoyaleApp {
       loadingPercent: document.getElementById('loading-percent'),
       loadingStep: document.getElementById('loading-step'),
       mainMenu: document.getElementById('main-menu'),
+      btnMenuDuelBot: document.getElementById('btn-menu-duel-bot'),
+      btnMenuDuelOnline: document.getElementById('btn-menu-duel-online'),
       btnMenuSingle: document.getElementById('btn-menu-single'),
       btnMenuCoop: document.getElementById('btn-menu-coop'),
       btnMenuMulti: document.getElementById('btn-menu-multi'),
       btnMenuMusic: document.getElementById('btn-menu-music'),
       modalCoop: document.getElementById('modal-coop'),
+      coopModalCard: document.getElementById('coop-modal-card'),
+      coopModalTitle: document.getElementById('coop-modal-title'),
+      coopModalSub: document.getElementById('coop-modal-sub'),
+      coopHostLabel: document.getElementById('coop-host-label'),
+      coopJoinLabel: document.getElementById('coop-join-label'),
       coopHostCode: document.getElementById('coop-host-code'),
       coopInviteLink: document.getElementById('coop-invite-link'),
       btnCoopCopy: document.getElementById('btn-coop-copy'),
@@ -116,9 +200,16 @@ class MazeRoyaleApp {
       pauseCoopCode: document.getElementById('pause-coop-code'),
       btnPauseShare: document.getElementById('btn-pause-share'),
       victoryOverlay: document.getElementById('victory-overlay'),
+      victoryBadge: document.getElementById('victory-badge'),
+      victoryTitle: document.getElementById('victory-title'),
+      victorySub: document.getElementById('victory-sub'),
       victoryStats: document.getElementById('victory-stats'),
+      btnVictoryNext: document.getElementById('btn-victory-next'),
       btnVictoryRestart: document.getElementById('btn-victory-restart'),
       btnVictoryMenu: document.getElementById('btn-victory-menu'),
+      respawnOverlay: document.getElementById('respawn-overlay'),
+      respawnSub: document.getElementById('respawn-sub'),
+      respawnCountdown: document.getElementById('respawn-countdown'),
       hudTop: document.getElementById('hud-top'),
       btnHudMusic: document.getElementById('btn-hud-music'),
       btnHudPause: document.getElementById('btn-hud-pause'),
@@ -134,6 +225,11 @@ class MazeRoyaleApp {
       statsLine: document.getElementById('stats-line'),
       levelBadge: document.getElementById('level-badge'),
       pageSlots: document.getElementById('page-slots'),
+      rivalHud: document.getElementById('rival-hud'),
+      rivalHudLabel: document.getElementById('rival-hud-label'),
+      rivalHudPages: document.getElementById('rival-hud-pages'),
+      rivalHpFill: document.getElementById('rival-hp-fill'),
+      rivalHudState: document.getElementById('rival-hud-state'),
       netStatus: document.getElementById('net-status'),
       toast: document.getElementById('toast-banner'),
       damageFlash: document.getElementById('damage-flash'),
@@ -168,16 +264,20 @@ class MazeRoyaleApp {
     this.controls = new GameControls(this.el);
 
     this.screenState = 'LOADING'; // 'LOADING' | 'MENU' | 'PLAYING' | 'PAUSED' | 'GAMEOVER' | 'VICTORY'
-    this.gameMode = 'single'; // 'single' | 'coop'
+    this.gameMode = 'single'; // 'single' | 'coop' | 'duel_bot' | 'duel_online'
+    this.pendingRoomModalMode = 'coop';
     this.netModalOpen = false;
     this.coopModalOpen = false;
     this.doorModalOpen = false;
-    this.hostRoomCode = this._generateRoomCode();
-    this.pendingInviteRoom = this._extractRoomCode(
-      typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('room') : ''
-    );
+    this.hostRoomCode = this._generateRoomCode('MR');
+    const urlParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+    this.pendingInviteRoom = this._extractRoomCode(urlParams ? urlParams.get('room') : '');
+    this.pendingInviteMode = urlParams?.get('mode') === 'duel' ? 'duel_online' : 'coop';
     this._coopInitialSynced = false;
     this.sharedPages = [];
+    this.rivalBot = null;
+    this.rivalKills = 0;
+    this.duelResult = null;
     this.level = 1;
     this.seed = Math.floor(Math.random() * 900000) + 1000;
     this.spawnSide = 'A';
@@ -214,9 +314,13 @@ class MazeRoyaleApp {
     requestAnimationFrame((t) => this._loop(t));
   }
 
-  _generateRoomCode() {
+  isDuelMode() {
+    return this.gameMode === 'duel_bot' || this.gameMode === 'duel_online';
+  }
+
+  _generateRoomCode(prefix = 'MR') {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let out = 'MR';
+    let out = prefix;
     for (let i = 0; i < 6; i++) {
       out += chars[Math.floor(Math.random() * chars.length)];
     }
@@ -239,26 +343,38 @@ class MazeRoyaleApp {
     return candidate.toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24);
   }
 
-  _buildInviteUrl(roomCode) {
+  _extractRoomMode(rawOrUrl, fallback = this.pendingRoomModalMode || 'coop') {
+    const str = String(rawOrUrl || '').trim();
+    if (str.includes('mode=duel')) return 'duel_online';
+    if (str.toUpperCase().startsWith('D1')) return 'duel_online';
+    return fallback;
+  }
+
+  _buildInviteUrl(roomCode, mode = this.pendingRoomModalMode || 'coop') {
     const code = this._extractRoomCode(roomCode) || this.hostRoomCode;
+    const isDuel = mode === 'duel_online';
     if (typeof window === 'undefined' || window.location.protocol === 'file:') {
-      return `?room=${encodeURIComponent(code)}`;
+      return isDuel ? `?room=${encodeURIComponent(code)}&mode=duel` : `?room=${encodeURIComponent(code)}`;
     }
     const u = new URL(window.location.href);
     u.search = '';
     u.hash = '';
     u.searchParams.set('room', code);
+    if (isDuel) u.searchParams.set('mode', 'duel');
     return u.toString();
   }
 
-  async _shareOrCopyInvite(roomCode) {
+  async _shareOrCopyInvite(roomCode, mode = this.gameMode === 'duel_online' ? 'duel_online' : (this.pendingRoomModalMode || 'coop')) {
     const code = this._extractRoomCode(roomCode) || this.hostRoomCode;
-    const url = this._buildInviteUrl(code);
+    const url = this._buildInviteUrl(code, mode);
+    const isDuel = mode === 'duel_online';
     if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
       try {
         await navigator.share({
-          title: 'Maze Royale — Dark Labyrinth (Co-op)',
-          text: `Entra nel mio labirinto Co-op (Codice: ${code}):`,
+          title: isDuel ? 'Maze Royale — Sfida 1 vs 1' : 'Maze Royale — Dark Labyrinth (Co-op)',
+          text: isDuel
+            ? `Accetta la sfida 1v1 nel labirinto! Cubo Blu vs Cubo Rosso (Codice: ${code}):`
+            : `Entra nel mio labirinto Co-op (Codice: ${code}):`,
           url
         });
         return;
@@ -301,9 +417,12 @@ class MazeRoyaleApp {
     this.el.modalPause?.classList.toggle('hidden', nextState !== 'PAUSED');
     this.el.deathOverlay?.classList.toggle('hidden', nextState !== 'GAMEOVER');
     this.el.victoryOverlay?.classList.toggle('hidden', nextState !== 'VICTORY');
+    if (nextState !== 'PLAYING') {
+      this.el.respawnOverlay?.classList.add('hidden');
+    }
 
     if (nextState === 'PAUSED' && this.el.pauseCoopShare) {
-      const showShare = this.gameMode === 'coop' && this.network?.roomId && this.network.roomId !== 'solo';
+      const showShare = (this.gameMode === 'coop' || this.gameMode === 'duel_online') && this.network?.roomId && this.network.roomId !== 'solo';
       this.el.pauseCoopShare.classList.toggle('hidden', !showShare);
       if (showShare && this.el.pauseCoopCode) {
         this.el.pauseCoopCode.textContent = this.network.roomId;
@@ -326,17 +445,80 @@ class MazeRoyaleApp {
     this.gameMode = 'single';
     this.spawnSide = 'A';
     this._coopInitialSynced = false;
+    this.duelResult = null;
+    this.rivalKills = 0;
     this.network.connect('solo', 'solo');
     this.restartArcadeRun();
   }
 
-  openCoopModal() {
+  startDuelBot(level = 1) {
+    audio.unlock();
+    this.gameMode = 'duel_bot';
+    this.spawnSide = 'A';
+    this._coopInitialSynced = false;
+    this.duelResult = null;
+    this.level = Math.max(1, Math.min(CONFIG.MAX_LEVELS, level));
+    this.seed = Math.floor(Math.random() * 900000) + 1000;
+    if (this.level === 1) {
+      this.kills = 0;
+      this.rivalKills = 0;
+    }
+    this.deadElapsed = 0;
+    this.network.connect('solo', 'solo');
+
+    this.closeCoopModal();
+    this.closeNetModal();
+    this.buildLevel(this.level, this.seed, false);
+    const sp = this.maze.spawnA;
+    if (this.level === 1) {
+      this.player.resetToFreshRun(sp.x, sp.z);
+    } else {
+      this.player.spawnAt(sp.x, sp.z, 0);
+    }
+    this.snapCameraToPlayer();
+    this.setScreenState('PLAYING');
+    this._syncHud();
+    this.showToast(`⚔️ 1 VS 1 vs Bot Rivale — Livello ${this.level}/${CONFIG.MAX_LEVELS}! Trova i tuoi 5 segnalini prima del Cubo Rosso!`);
+  }
+
+  openRoomModal(mode = 'coop') {
+    this.pendingRoomModalMode = mode === 'duel_online' ? 'duel_online' : 'coop';
+    const isDuel = this.pendingRoomModalMode === 'duel_online';
+    const desiredPrefix = isDuel ? 'D1' : 'MR';
+    if (!this.hostRoomCode || !this.hostRoomCode.startsWith(desiredPrefix)) {
+      this.hostRoomCode = this._generateRoomCode(desiredPrefix);
+    }
     this.coopModalOpen = true;
-    this.hostRoomCode = this.hostRoomCode || this._generateRoomCode();
+
+    this.el.coopModalCard?.classList.toggle('duel-mode', isDuel);
+    if (this.el.coopModalTitle) {
+      this.el.coopModalTitle.textContent = isDuel ? '🔥 1 VS 1 ONLINE (MAX 2 GIOCATORI)' : '🤝 MODALITÀ CO-OP CON CODICE';
+    }
+    if (this.el.coopModalSub) {
+      this.el.coopModalSub.textContent = isDuel
+        ? 'Sfida un amico in 1v1: i 5 segnalini sono sdoppiati e privati per ciascuno (vedi solo i tuoi). Combatti il Cubo Rosso e sblocca per primo il Portale!'
+        : 'Condividi il codice con il tuo amico: i fogli raccolti sono condivisi tra entrambi e se uno sblocca il portale centrale avanzate insieme (5 livelli progressivi)!';
+    }
+    if (this.el.coopHostLabel) {
+      this.el.coopHostLabel.textContent = isDuel ? '1. CREA SFIDA 1 VS 1 (TU = CUBO BLU)' : '1. OSPITA PARTITA CO-OP (SPAWN A)';
+    }
+    if (this.el.coopJoinLabel) {
+      this.el.coopJoinLabel.textContent = isDuel ? '2. ACCETTA SFIDA 1 VS 1 (SPAWN B)' : '2. ENTRA NEL MONDO DI UN AMICO (SPAWN B)';
+    }
+    if (this.el.btnCoopHost) {
+      this.el.btnCoopHost.textContent = isDuel ? '⚔️ CREA STANZA 1 VS 1' : '🚀 CREA MONDO CO-OP';
+    }
+    if (this.el.inpCoopCode) {
+      this.el.inpCoopCode.placeholder = isDuel ? 'Codice (es. D17K2P) o Link Sfida' : 'Codice (es. MR7K2P) o Link Invito';
+    }
     if (this.el.coopHostCode) this.el.coopHostCode.textContent = this.hostRoomCode;
-    if (this.el.coopInviteLink) this.el.coopInviteLink.textContent = this._buildInviteUrl(this.hostRoomCode);
+    if (this.el.coopInviteLink) this.el.coopInviteLink.textContent = this._buildInviteUrl(this.hostRoomCode, this.pendingRoomModalMode);
     this.el.modalCoop?.classList.remove('hidden');
     this._syncControlsBlocked();
+  }
+
+  openCoopModal() {
+    this.openRoomModal('coop');
   }
 
   closeCoopModal() {
@@ -364,20 +546,39 @@ class MazeRoyaleApp {
     this._syncControlsBlocked();
   }
 
-  async startCoopHost(rawCode) {
+  _rebuildRemoteVisuals() {
+    const isCoop = this.gameMode === 'coop';
+    const existingIds = [...this.remoteVisuals.keys()];
+    for (const pid of existingIds) {
+      const old = this.remoteVisuals.get(pid);
+      old?.dispose(this.scene);
+      this.remoteVisuals.delete(pid);
+    }
+    if (this.network?.remotePlayers) {
+      for (const pid of this.network.remotePlayers.keys()) {
+        this.remoteVisuals.set(pid, new RemotePlayerVisual(pid, this.scene, isCoop));
+      }
+    }
+  }
+
+  async _startRoomHost(mode, rawCode) {
     audio.unlock();
-    const cleanCode = String(rawCode || this.hostRoomCode || this._generateRoomCode())
+    const isDuel = mode === 'duel_online';
+    const prefix = isDuel ? 'D1' : 'MR';
+    const cleanCode = String(rawCode || this.hostRoomCode || this._generateRoomCode(prefix))
       .trim()
       .toUpperCase()
       .replace(/[^A-Z0-9_-]/g, '')
-      .slice(0, 20) || this._generateRoomCode();
+      .slice(0, 20) || this._generateRoomCode(prefix);
 
     this.hostRoomCode = cleanCode;
-    this.gameMode = 'coop';
+    this.gameMode = isDuel ? 'duel_online' : 'coop';
     this.spawnSide = 'A';
     this.level = 1;
     this.seed = Math.floor(Math.random() * 900000) + 1000;
     this.kills = 0;
+    this.rivalKills = 0;
+    this.duelResult = null;
     this.deadElapsed = 0;
     this._coopInitialSynced = true;
 
@@ -387,30 +588,38 @@ class MazeRoyaleApp {
     this.player.resetToFreshRun(sp.x, sp.z);
     this.snapCameraToPlayer();
 
-    await this.network.connect(cleanCode, 'host');
+    await this.network.connect(cleanCode, 'host', {
+      maxPeers: isDuel ? 1 : 0,
+      modeLabel: isDuel ? '1v1' : 'CO-OP'
+    });
+    this._rebuildRemoteVisuals();
     this.network.publishFullRoomSync(this._buildRoomSnapshot());
     if (this.el.inpRoom) this.el.inpRoom.value = this.network.roomId;
 
     this.setScreenState('PLAYING');
     this._syncHud();
-    this.showToast(`🤝 Mondo Co-op creato! Codice: ${this.network.roomId}`);
+    this.showToast(isDuel
+      ? `🔥 Stanza 1v1 creata! Codice: ${this.network.roomId} (Max 2 giocatori)`
+      : `🤝 Mondo Co-op creato! Codice: ${this.network.roomId}`);
   }
 
-  async startCoopGuest(rawCode, opts = {}) {
+  async _startRoomGuest(mode, rawCode, opts = {}) {
     const cleanCode = this._extractRoomCode(rawCode);
-
     if (!cleanCode) {
       this.showToast('Inserisci un codice stanza valido!');
       this.el.inpCoopCode?.focus();
       return;
     }
 
+    const isDuel = mode === 'duel_online';
     audio.unlock();
-    this.gameMode = 'coop';
+    this.gameMode = isDuel ? 'duel_online' : 'coop';
     this.spawnSide = 'B';
     this.level = 1;
     this.seed = Math.floor(Math.random() * 900000) + 1000;
     this.kills = 0;
+    this.rivalKills = 0;
+    this.duelResult = null;
     this.deadElapsed = 0;
     this._coopInitialSynced = false;
 
@@ -421,12 +630,23 @@ class MazeRoyaleApp {
     this.snapCameraToPlayer();
 
     this.setScreenState('PLAYING', opts);
-    await this.network.connect(cleanCode, 'guest');
+    await this.network.connect(cleanCode, 'guest', {
+      maxPeers: isDuel ? 1 : 0,
+      modeLabel: isDuel ? '1v1' : 'CO-OP'
+    });
+    this._rebuildRemoteVisuals();
     if (this.el.inpRoom) this.el.inpRoom.value = this.network.roomId;
 
     this._syncHud();
-    this.showToast(`🔑 Entrato in Co-op (${this.network.roomId}) — Spawn B!`);
+    this.showToast(isDuel
+      ? `⚔️ Entrato in sfida 1v1 (${this.network.roomId}) — Trova i tuoi 5 segnalini!`
+      : `🔑 Entrato in Co-op (${this.network.roomId}) — Spawn B!`);
   }
+
+  startCoopHost(rawCode) { return this._startRoomHost('coop', rawCode); }
+  startCoopGuest(rawCode, opts = {}) { return this._startRoomGuest('coop', rawCode, opts); }
+  startDuelOnlineHost(rawCode) { return this._startRoomHost('duel_online', rawCode); }
+  startDuelOnlineGuest(rawCode, opts = {}) { return this._startRoomGuest('duel_online', rawCode, opts); }
 
   pauseGame() {
     if (this.screenState !== 'PLAYING') return;
@@ -443,13 +663,16 @@ class MazeRoyaleApp {
     this.closeCoopModal();
     this.closeNetModal();
     this.network?.disconnect();
+    this.rivalBot = null;
+    this.duelResult = null;
     this.gameMode = 'single';
     this.spawnSide = 'A';
-    this.hostRoomCode = this._generateRoomCode();
-    if (typeof window !== 'undefined' && window.location.search.includes('room=')) {
+    this.hostRoomCode = this._generateRoomCode('MR');
+    if (typeof window !== 'undefined' && (window.location.search.includes('room=') || window.location.search.includes('mode='))) {
       try {
         const cleanUrl = new URL(window.location.href);
         cleanUrl.searchParams.delete('room');
+        cleanUrl.searchParams.delete('mode');
         window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
       } catch (_) {}
     }
@@ -508,13 +731,18 @@ class MazeRoyaleApp {
 
       if (elapsed >= MIN_LOADING_MS && assetsReady) {
         const invite = this.pendingInviteRoom;
+        const inviteMode = this.pendingInviteMode;
         this.pendingInviteRoom = '';
-        setProgress(100, invite ? `Ingresso Co-op (${invite})...` : 'Pronto! Apertura Menu Principale...');
+        setProgress(100, invite ? `Ingresso Stanza (${invite})...` : 'Pronto! Apertura Menu Principale...');
 
         // Prepara gia' sotto il menu (o il gioco su invito) prima di far sfumare lo splash,
         // cosi' non si intravede mai il canvas 3D nudo durante la transizione.
         if (invite) {
-          this.startCoopGuest(invite, { keepLoadingVisible: true });
+          if (inviteMode === 'duel_online' || invite.startsWith('D1')) {
+            this.startDuelOnlineGuest(invite, { keepLoadingVisible: true });
+          } else {
+            this.startCoopGuest(invite, { keepLoadingVisible: true });
+          }
         } else {
           this.setScreenState('MENU', { keepLoadingVisible: true });
         }
@@ -570,7 +798,7 @@ class MazeRoyaleApp {
     this.levelGroup = new THREE.Group();
     this.scene.add(this.levelGroup);
 
-    this.player = new PlayerCube('local', 'TU', 0x3b82f6);
+    this.player = new PlayerCube('local', 'TU', 0x2563eb);
     this.scene.add(this.player.group);
 
     this.remoteVisuals = new Map();
@@ -602,17 +830,24 @@ class MazeRoyaleApp {
         if (this.el.netStatus) this.el.netStatus.textContent = label;
       },
       onPeerHello: () => {
-        if (this.gameMode === 'coop' && this.maze) {
+        if ((this.gameMode === 'coop' || this.gameMode === 'duel_online') && this.maze && this.network.coopRole === 'host') {
           this.network.publishFullRoomSync(this._buildRoomSnapshot());
         }
       },
+      onRoomFull: () => {
+        if (this.gameMode === 'duel_online') {
+          this.network.disconnect();
+          this.returnToMainMenu();
+          this.showToast('⛔ Stanza 1v1 già piena (massimo 2 giocatori)!');
+        }
+      },
       onRoomMeta: (meta) => {
-        if (this.gameMode === 'coop') {
+        if (this.gameMode === 'coop' || this.gameMode === 'duel_online') {
           this._applyFullRoomSync(meta);
         }
       },
       onFullRoomSync: (snapshot) => {
-        if (this.gameMode === 'coop') {
+        if (this.gameMode === 'coop' || this.gameMode === 'duel_online') {
           this._applyFullRoomSync(snapshot);
         }
       },
@@ -623,42 +858,78 @@ class MazeRoyaleApp {
             this.remoteVisuals.delete(pid);
           }
         }
+        const isCoop = this.gameMode === 'coop';
         for (const pid of map.keys()) {
           if (!this.remoteVisuals.has(pid)) {
-            this.remoteVisuals.set(pid, new RemotePlayerVisual(pid, this.scene, this.gameMode === 'coop'));
+            this.remoteVisuals.set(pid, new RemotePlayerVisual(pid, this.scene, isCoop));
           }
         }
       },
       onIncomingHit: (hit) => {
         if (!this.player.alive || this.gameMode === 'coop') return;
-        const lastPagesCount = this.player.collectedPages.length;
-        const res = this.player.takeDamage(hit.damage || CONFIG.BASE_SWORD_DAMAGE, this.maze, (dropped) => {
-          this._dropPagesToWorld(dropped, true);
+        const res = this._applyPlayerDamage(
+          hit.damage || CONFIG.BASE_SWORD_DAMAGE,
+          hit.fromX,
+          hit.fromZ,
+          'Rivale Online'
+        );
+        this.network.sendHitResult(hit.fromId, {
+          hitId: hit.hitId,
+          blocked: Boolean(res.blocked),
+          died: Boolean(res.died),
+          remainingHp: Math.ceil(this.player.hp)
         });
+      },
+      onHitResult: (res) => {
+        if (!res) return;
         if (res.blocked) {
-          this.showToast('Colpo avversario parato con lo Scudo!');
-        } else {
-          this._triggerDamageFlash();
-          if (res.died) this._onPlayerDied(lastPagesCount);
+          audio.playShieldBlock();
+          this.showToast('🛡️ Il Cubo Rosso ha parato il colpo!');
+        } else if (res.died) {
+          this.rivalKills += 1;
+          this.player.hp = Math.min(this.player.maxHp, this.player.hp + CONFIG.RIVAL_KILL_HEAL);
+          this.showToast(`⚔️ Rivale eliminato! (+${CONFIG.RIVAL_KILL_HEAL} HP — segnalini caduti)`);
+          this._syncHud();
         }
       },
+      onDuelWin: (msg) => {
+        if (this.gameMode === 'duel_online' && msg && msg.winnerId !== this.network.playerId) {
+          this._onDuelFinished(false, msg.winnerName || 'Cubo Rosso (Rivale)');
+        }
+      },
+      onDuelReset: (msg) => {
+        if (this.gameMode !== 'duel_online' || !msg?.seed) return;
+        const nextLevel = Math.max(1, Math.min(CONFIG.MAX_LEVELS, msg.level || 1));
+        this.duelResult = null;
+        if (nextLevel === 1) {
+          this.kills = 0;
+          this.rivalKills = 0;
+        }
+        this.buildLevel(nextLevel, msg.seed, false);
+        const sp = this.spawnSide === 'B' ? this.maze.spawnB : this.maze.spawnA;
+        if (nextLevel === 1) {
+          this.player.resetToFreshRun(sp.x, sp.z);
+        } else {
+          this.player.spawnAt(sp.x, sp.z, 0);
+        }
+        this.snapCameraToPlayer();
+        this.setScreenState('PLAYING');
+        this._syncHud();
+        this.showToast(`⚔️ Nuova sfida 1v1 — Livello ${nextLevel}/${CONFIG.MAX_LEVELS}!`);
+      },
       onPageEvent: (ev) => {
-        if (!ev) return;
+        if (!ev || this.gameMode !== 'coop') return;
         const wp = this.pages.find((p) => p.originalIndex === ev.index);
         if (ev.action === 'PICKUP') {
           if (wp) {
             wp.collected = true;
             wp.mesh.visible = false;
           }
-          if (this.gameMode === 'coop') {
-            this._applySharedPage({
-              originalIndex: ev.index,
-              slot: wp?.slot ?? ev.slot,
-              symbol: wp?.symbol ?? ev.symbol
-            }, true);
-          }
-        } else if (ev.action === 'DROP' && wp && this.gameMode !== 'coop') {
-          wp.setWorldPosition(ev.x, ev.z);
+          this._applySharedPage({
+            originalIndex: ev.index,
+            slot: wp?.slot ?? ev.slot,
+            symbol: wp?.symbol ?? ev.symbol
+          }, true);
         }
       },
       onChestOpened: (chestId) => {
@@ -666,6 +937,7 @@ class MazeRoyaleApp {
         if (ch && !ch.opened) ch.open();
       },
       onLevelAdvance: (lvl, nextSeed, winnerName, victory = false) => {
+        if (this.gameMode !== 'coop') return;
         if (victory) {
           this._onVictory(winnerName);
           return;
@@ -681,15 +953,18 @@ class MazeRoyaleApp {
 
   _buildRoomSnapshot() {
     return {
+      gameMode: this.gameMode,
       level: this.level,
       seed: this.seed,
-      collectedPages: this.sharedPages.map((p) => ({
-        originalIndex: p.originalIndex,
-        slot: p.slot,
-        symbol: p.symbol
-      })),
+      collectedPages: this.gameMode === 'coop'
+        ? this.sharedPages.map((p) => ({
+            originalIndex: p.originalIndex,
+            slot: p.slot,
+            symbol: p.symbol
+          }))
+        : [],
       openedChests: this.chests.filter((c) => c.opened).map((c) => c.id),
-      victory: this.screenState === 'VICTORY'
+      victory: this.gameMode === 'coop' && this.screenState === 'VICTORY'
     };
   }
 
@@ -728,7 +1003,23 @@ class MazeRoyaleApp {
 
   _applyFullRoomSync(snapshot) {
     if (!snapshot) return;
-    if (snapshot.victory) {
+    if (snapshot.gameMode === 'duel_online' || snapshot.gameMode === 'coop') {
+      if (this.gameMode !== snapshot.gameMode) {
+        this.gameMode = snapshot.gameMode;
+        this.network.maxPeers = this.gameMode === 'duel_online' ? 1 : 0;
+        this.network.modeLabel = this.gameMode === 'duel_online' ? '1v1' : 'CO-OP';
+        this._rebuildRemoteVisuals();
+      }
+    }
+
+    if (snapshot.duelWinner && this.gameMode === 'duel_online') {
+      if (snapshot.duelWinner.winnerId !== this.network.playerId && this.screenState !== 'VICTORY') {
+        this._onDuelFinished(false, snapshot.duelWinner.winnerName || 'Cubo Rosso (Rivale)');
+      }
+      return;
+    }
+
+    if (snapshot.victory && this.gameMode === 'coop') {
       if (this.screenState !== 'VICTORY') {
         this._onVictory(snapshot.winnerName);
       }
@@ -743,16 +1034,21 @@ class MazeRoyaleApp {
     if (changed || !this._coopInitialSynced) {
       const prevLevel = this.level;
       this._coopInitialSynced = true;
+      this.duelResult = null;
       this.buildLevel(targetLevel, targetSeed, false);
-      if (snapshot.winnerName && targetLevel > prevLevel) {
+      if (this.gameMode === 'duel_online') {
+        this.showToast(`⚔️ Stanza 1v1 (${this.network.roomId}) — Trova i tuoi 5 segnalini!`);
+      } else if (snapshot.winnerName && targetLevel > prevLevel) {
         this.showToast(`🚪 ${snapshot.winnerName} ha sbloccato il Portale! Livello ${this.level}/${CONFIG.MAX_LEVELS}`);
       } else {
         this.showToast(`🤝 Mondo Co-op (${this.network.roomId}) — Livello ${this.level}/${CONFIG.MAX_LEVELS}`);
       }
     }
 
-    for (const pg of (snapshot.collectedPages || [])) {
-      this._applySharedPage(pg, false);
+    if (this.gameMode === 'coop') {
+      for (const pg of (snapshot.collectedPages || [])) {
+        this._applySharedPage(pg, false);
+      }
     }
     for (const cid of (snapshot.openedChests || [])) {
       const ch = this.chests.find((c) => c.id === cid);
@@ -774,6 +1070,7 @@ class MazeRoyaleApp {
     this.pages = [];
     this.chests = [];
     this.bots = [];
+    this.rivalBot = null;
 
     this.level = level;
     this.seed = seed;
@@ -840,8 +1137,16 @@ class MazeRoyaleApp {
     }
 
     // 6. Bot nemici verdi lenti (40 HP, invisibili nel buio e dietro i muri)
-    for (const bData of this.maze.botSpawns) {
+    const botSpawns = this.isDuelMode()
+      ? this.maze.botSpawns.slice(0, Math.min(8, 2 + level * 2))
+      : this.maze.botSpawns;
+    for (const bData of botSpawns) {
       this.bots.push(new EnemyBot(bData, this.levelGroup));
+    }
+
+    // 7. Rivale Cubo Rosso IA (solo in modalita' 1v1 vs Bot, ha i suoi 5 segnalini privati sovrapposti!)
+    if (this.gameMode === 'duel_bot') {
+      this.rivalBot = new RivalBot(this.maze, this.levelGroup);
     }
 
     // Spawn giocatore: A (basso a sinistra) o B (alto a destra) + camera snap istantaneo!
@@ -853,10 +1158,11 @@ class MazeRoyaleApp {
 
     this.el.deathOverlay?.classList.add('hidden');
     this.el.victoryOverlay?.classList.add('hidden');
+    this.el.respawnOverlay?.classList.add('hidden');
     this.closeDoorModal();
     this._syncHud();
 
-    if (publishMeta && this.gameMode === 'coop') {
+    if (publishMeta && (this.gameMode === 'coop' || this.gameMode === 'duel_online')) {
       this.network.publishFullRoomSync(this._buildRoomSnapshot());
     }
   }
@@ -934,9 +1240,69 @@ class MazeRoyaleApp {
     this._syncHud();
   }
 
+  _onLocalDuelRespawn() {
+    this.el.respawnOverlay?.classList.add('hidden');
+    this.snapCameraToPlayer();
+    this._syncHud();
+    this.showToast(`🔄 Rientrato allo Spawn ${this.spawnSide}! Recupera i tuoi segnalini!`);
+  }
+
+  _applyPlayerDamage(amount, fromX = undefined, fromZ = undefined, attackerLabel = 'Nemico') {
+    if (!this.player.alive) return { blocked: false, died: false };
+    const lastPagesCount = this.player.collectedPages.length;
+    const isDuel = this.isDuelMode();
+    const res = this.player.takeDamage(
+      amount,
+      this.maze,
+      this.gameMode === 'coop'
+        ? null
+        : (dropped) => {
+            // In 1v1 e Singleplayer i segnalini caduti restano PRIVATI sullo schermo locale!
+            this._dropPagesToWorld(dropped, false);
+          },
+      isDuel
+    );
+
+    if (res.blocked) {
+      this.controls.rumble(65, 0.35, 0.2);
+      this.showToast('🛡️ Attacco parato dallo Scudo!');
+      return res;
+    }
+
+    this.controls.rumble(140, 0.35, 0.75);
+    this._triggerDamageFlash();
+
+    if (res.died) {
+      if (isDuel) {
+        this.closeDoorModal();
+        if (this.el.respawnSub) {
+          this.el.respawnSub.textContent = lastPagesCount > 0
+            ? `Abbattuto da ${attackerLabel} — i tuoi ${lastPagesCount} segnalini sono caduti a terra!`
+            : `Abbattuto da ${attackerLabel} — rientro allo Spawn...`;
+        }
+        this.showToast(`💀 Eliminato da ${attackerLabel}! Respawn tra ${CONFIG.RESPAWN_SECONDS}s!`);
+      } else {
+        this._onPlayerDied(lastPagesCount);
+      }
+    } else if (fromX !== undefined && fromZ !== undefined) {
+      this.player.applyKnockback(this.player.x - fromX, this.player.z - fromZ);
+    }
+
+    this._syncHud();
+    return res;
+  }
+
   _onVictory(winnerName = '') {
     this.closeDoorModal();
     this.player.shieldActive = false;
+    this.duelResult = 'WIN';
+    this.el.victoryOverlay?.classList.remove('defeat-theme');
+    this.el.btnVictoryNext?.classList.add('hidden');
+    if (this.el.victoryBadge) this.el.victoryBadge.textContent = '🏆 CAMPAGNA COMPLETATA 🏆';
+    if (this.el.victoryTitle) this.el.victoryTitle.textContent = 'LABIRINTO CONQUISTATO!';
+    if (this.el.victorySub) {
+      this.el.victorySub.textContent = `Tutti e ${CONFIG.MAX_LEVELS} i livelli (fino a ${5 + CONFIG.MAX_LEVELS * 8}×${5 + CONFIG.MAX_LEVELS * 8}) sono stati superati!`;
+    }
     if (this.el.victoryStats) {
       const modeLabel = this.gameMode === 'coop' ? `Co-op (${this.network.roomId})` : 'Singleplayer';
       const by = winnerName ? ` • Sbloccato da: ${winnerName}` : '';
@@ -947,10 +1313,47 @@ class MazeRoyaleApp {
     this._syncHud();
   }
 
+  _onDuelFinished(playerWon, winnerName = '') {
+    this.closeDoorModal();
+    this.player.shieldActive = false;
+    this.duelResult = playerWon ? 'WIN' : 'LOSS';
+    this.el.victoryOverlay?.classList.toggle('defeat-theme', !playerWon);
+    if (this.el.victoryBadge) {
+      this.el.victoryBadge.textContent = playerWon
+        ? `⚔️ VITTORIA DUELLO 1V1 (${this.maze.N}×${this.maze.N})`
+        : '🟥 SCONFITTA DUELLO 1V1';
+    }
+    if (this.el.victoryTitle) {
+      this.el.victoryTitle.textContent = playerWon ? 'HAI VINTO IL DUELLO!' : 'IL RIVALE HA VINTO!';
+    }
+    if (this.el.victorySub) {
+      this.el.victorySub.textContent = playerWon
+        ? `Hai sbloccato per primo il Portale al centro del Livello ${this.level}!`
+        : `${winnerName || 'Il Cubo Rosso'} ha sbloccato per primo il Portale centrale!`;
+    }
+    if (this.el.victoryStats) {
+      const oppPages = this.gameMode === 'duel_bot'
+        ? (this.rivalBot?.collectedPages.length ?? 0)
+        : (([...this.network.remotePlayers.values()][0]?.pagesCount) ?? 0);
+      this.el.victoryStats.textContent =
+        `Livello ${this.level}/${CONFIG.MAX_LEVELS} • Tuoi Fogli: ${this.player.collectedPages.length}/5 • Fogli Rivale: ${oppPages}/5 • Rivale Abbattuto: ${this.rivalKills} • Guardiani: ${this.kills}`;
+    }
+    const canAdvance = playerWon && this.level < CONFIG.MAX_LEVELS;
+    this.el.btnVictoryNext?.classList.toggle('hidden', !canAdvance);
+    this.setScreenState('VICTORY');
+    this._syncHud();
+  }
+
   restartArcadeRun() {
+    if (this.gameMode === 'duel_bot') {
+      this.startDuelBot(1);
+      return;
+    }
     this.level = 1;
     this.seed = Math.floor(Math.random() * 900000) + 1000;
     this.kills = 0;
+    this.rivalKills = 0;
+    this.duelResult = null;
     this.deadElapsed = 0;
     this.sharedPages = [];
     this.controls.keys.delete('Space');
@@ -967,6 +1370,9 @@ class MazeRoyaleApp {
       this.network.publishLevelAdvance(1, this.seed, this.player.name, false);
       this.network.publishFullRoomSync(this._buildRoomSnapshot());
       this.showToast(`Co-op riavviata — Livello 1/${CONFIG.MAX_LEVELS} (${this.maze.N}×${this.maze.N})!`);
+    } else if (this.gameMode === 'duel_online') {
+      this.network.publishDuelReset(1, this.seed);
+      this.showToast(`⚔️ Nuovo Duello 1v1 — Livello 1/${CONFIG.MAX_LEVELS} (${this.maze.N}×${this.maze.N})!`);
     } else {
       this.showToast(`Partita Singleplayer — Livello 1/${CONFIG.MAX_LEVELS} (${this.maze.N}×${this.maze.N})!`);
     }
@@ -1038,11 +1444,30 @@ class MazeRoyaleApp {
     this.el.btnRestartArcade?.addEventListener('click', () => this.restartArcadeRun());
     this.el.btnRespawnPvp?.addEventListener('click', () => this.respawnInPvpRoom());
     this.el.btnDeathMenu?.addEventListener('click', () => this.returnToMainMenu());
+    this.el.btnVictoryNext?.addEventListener('click', () => {
+      const nextLevel = Math.min(CONFIG.MAX_LEVELS, this.level + 1);
+      if (this.gameMode === 'duel_bot') {
+        this.startDuelBot(nextLevel);
+      } else if (this.gameMode === 'duel_online') {
+        const nextSeed = Math.floor(Math.random() * 900000) + 1000;
+        this.duelResult = null;
+        this.buildLevel(nextLevel, nextSeed, false);
+        const sp = this.spawnSide === 'B' ? this.maze.spawnB : this.maze.spawnA;
+        this.player.spawnAt(sp.x, sp.z, 0);
+        this.snapCameraToPlayer();
+        this.network.publishDuelReset(nextLevel, nextSeed);
+        this.setScreenState('PLAYING');
+        this._syncHud();
+        this.showToast(`⚔️ Round 1v1 — Livello ${nextLevel}/${CONFIG.MAX_LEVELS}!`);
+      }
+    });
     this.el.btnVictoryRestart?.addEventListener('click', () => this.restartArcadeRun());
     this.el.btnVictoryMenu?.addEventListener('click', () => this.returnToMainMenu());
 
+    this.el.btnMenuDuelBot?.addEventListener('click', () => this.startDuelBot(1));
+    this.el.btnMenuDuelOnline?.addEventListener('click', () => this.openRoomModal('duel_online'));
     this.el.btnMenuSingle?.addEventListener('click', () => this.startSingleplayer());
-    this.el.btnMenuCoop?.addEventListener('click', () => this.openCoopModal());
+    this.el.btnMenuCoop?.addEventListener('click', () => this.openRoomModal('coop'));
     this.el.btnMenuMulti?.addEventListener('click', () => this.openNetModal());
     this.el.btnMenuMusic?.addEventListener('click', () => this._toggleMusic());
 
@@ -1054,21 +1479,38 @@ class MazeRoyaleApp {
       this.showToast(`Codice stanza copiato: ${code}`);
     });
     this.el.btnCoopShare?.addEventListener('click', () => {
-      this._shareOrCopyInvite(this.el.coopHostCode?.textContent || this.hostRoomCode);
+      this._shareOrCopyInvite(this.el.coopHostCode?.textContent || this.hostRoomCode, this.pendingRoomModalMode);
     });
     this.el.btnPauseShare?.addEventListener('click', () => {
-      this._shareOrCopyInvite(this.network?.roomId || this.hostRoomCode);
+      this._shareOrCopyInvite(this.network?.roomId || this.hostRoomCode, this.gameMode === 'duel_online' ? 'duel_online' : 'coop');
     });
     this.el.btnCoopHost?.addEventListener('click', () => {
-      this.startCoopHost(this.el.coopHostCode?.textContent || this.hostRoomCode);
+      const code = this.el.coopHostCode?.textContent || this.hostRoomCode;
+      if (this.pendingRoomModalMode === 'duel_online') {
+        this.startDuelOnlineHost(code);
+      } else {
+        this.startCoopHost(code);
+      }
     });
     this.el.btnCoopJoin?.addEventListener('click', () => {
-      this.startCoopGuest(this.el.inpCoopCode?.value);
+      const raw = this.el.inpCoopCode?.value;
+      const detected = this._extractRoomMode(raw, this.pendingRoomModalMode);
+      if (detected === 'duel_online') {
+        this.startDuelOnlineGuest(raw);
+      } else {
+        this.startCoopGuest(raw);
+      }
     });
     this.el.inpCoopCode?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
-        this.startCoopGuest(this.el.inpCoopCode.value);
+        const raw = this.el.inpCoopCode.value;
+        const detected = this._extractRoomMode(raw, this.pendingRoomModalMode);
+        if (detected === 'duel_online') {
+          this.startDuelOnlineGuest(raw);
+        } else {
+          this.startCoopGuest(raw);
+        }
       }
     });
     this.el.btnCoopClose?.addEventListener('click', () => this.closeCoopModal());
@@ -1086,7 +1528,7 @@ class MazeRoyaleApp {
     this.el.btnNewMaze?.addEventListener('click', () => {
       const nextSeed = Math.floor(Math.random() * 900000) + 1000;
       this.closeNetModal();
-      this.buildLevel(1, nextSeed, this.gameMode === 'coop');
+      this.buildLevel(1, nextSeed, this.gameMode === 'coop' || this.gameMode === 'duel_online');
       this.setScreenState('PLAYING');
       this.showToast('Nuovo Labirinto Speculare generato!');
     });
@@ -1094,8 +1536,13 @@ class MazeRoyaleApp {
     this.el.btnClearFb?.addEventListener('click', () => {
       saveFirebaseConfig(null);
       this.el.inpFbJson.value = '';
-      if (this.gameMode === 'coop') {
-        this.network.connect(this.el.inpRoom.value || this.network.roomId, this.spawnSide === 'B' ? 'guest' : 'host');
+      if (this.gameMode === 'coop' || this.gameMode === 'duel_online') {
+        const isDuel = this.gameMode === 'duel_online';
+        this.network.connect(
+          this.el.inpRoom.value || this.network.roomId,
+          this.spawnSide === 'B' ? 'guest' : 'host',
+          { maxPeers: isDuel ? 1 : 0, modeLabel: isDuel ? '1v1' : 'CO-OP' }
+        );
       }
       this.showToast("Modalita' Locale multi-scheda ripristinata");
     });
@@ -1123,9 +1570,14 @@ class MazeRoyaleApp {
       this.closeNetModal();
       const targetRoom = (this.el.inpRoom.value || '').trim();
       if (targetRoom) {
-        this.gameMode = 'coop';
+        const isDuel = this.gameMode === 'duel_online';
+        this.gameMode = isDuel ? 'duel_online' : 'coop';
         const role = this.spawnSide === 'B' ? 'guest' : 'host';
-        this.network.connect(targetRoom, role).then(() => {
+        this.network.connect(targetRoom, role, {
+          maxPeers: isDuel ? 1 : 0,
+          modeLabel: isDuel ? '1v1' : 'CO-OP'
+        }).then(() => {
+          this._rebuildRemoteVisuals();
           if (role === 'host') this.network.publishFullRoomSync(this._buildRoomSnapshot());
         });
       }
@@ -1199,6 +1651,19 @@ class MazeRoyaleApp {
       audio.playSuccess();
       this.closeDoorModal();
 
+      if (this.isDuelMode()) {
+        if (this.gameMode === 'duel_online') {
+          this.network.publishDuelWin(
+            this.level,
+            this.player.name,
+            this.player.collectedPages.length,
+            this.rivalKills
+          );
+        }
+        this._onDuelFinished(true, this.player.name);
+        return;
+      }
+
       if (this.level >= CONFIG.MAX_LEVELS) {
         this.network.publishLevelAdvance(CONFIG.MAX_LEVELS, this.seed, this.player.name, true);
         this._onVictory(this.player.name);
@@ -1216,26 +1681,10 @@ class MazeRoyaleApp {
     // CODICE SBAGLIATO: chiudi UI, 20 danni e teletrasporto punitivo allo spawn!
     audio.playPunish();
     this.closeDoorModal();
-    this._triggerDamageFlash();
-
-    const wasShielding = this.player.shieldActive;
-    const lastPagesCount = this.player.collectedPages.length;
     this.player.shieldActive = false; // La maledizione della porta non si para con lo scudo
-    const res = this.player.takeDamage(
-      CONFIG.WRONG_CODE_DAMAGE,
-      this.maze,
-      this.gameMode === 'coop'
-        ? null
-        : (dropped) => {
-            this._dropPagesToWorld(dropped, false);
-          }
-    );
-    this.player.shieldActive = wasShielding;
+    const res = this._applyPlayerDamage(CONFIG.WRONG_CODE_DAMAGE, undefined, undefined, 'Maledizione Portale');
 
-    if (res.died) {
-      this._onPlayerDied(lastPagesCount);
-      this.showToast('Codice Errato! -20 HP fatali!');
-    } else {
+    if (!res.died && this.player.alive) {
       this.player.x = this.player.spawn.x;
       this.player.z = this.player.spawn.z;
       this.player.syncTransform();
@@ -1329,14 +1778,25 @@ class MazeRoyaleApp {
       audio.unlock();
     }
 
-    const activeHitbox = this.player.update(dt, this.maze, input);
+    const activeHitbox = this.player.update(dt, this.maze, input, {
+      onRespawn: () => this._onLocalDuelRespawn()
+    });
 
-    // Fendente spada contro Bot nemici (in Co-op ZERO fuoco amico verso il compagno!)
+    // Countdown overlay respawn live durante il 1v1
+    if (this.el.respawnOverlay) {
+      const showRespawn = this.isDuelMode() && !this.player.alive && this.player.respawnTimer > 0;
+      this.el.respawnOverlay.classList.toggle('hidden', !showRespawn);
+      if (showRespawn && this.el.respawnCountdown) {
+        this.el.respawnCountdown.textContent = String(Math.max(1, Math.ceil(this.player.respawnTimer)));
+      }
+    }
+
+    // Fendente spada contro Bot nemici e Cubo Rosso rivale (in Co-op ZERO fuoco amico verso il compagno!)
     if (activeHitbox && this.player.alive) {
       for (const bot of this.bots) {
         if (!bot.alive || activeHitbox.hitTargets.has(bot.id)) continue;
         const d = Math.hypot(bot.x - activeHitbox.x, bot.z - activeHitbox.z);
-        if (d <= activeHitbox.radius + CONFIG.BOT_RADIUS) {
+        if (d <= activeHitbox.radius + CONFIG.BOT_RADIUS && hasLineOfSight(this.maze, this.player.x, this.player.z, bot.x, bot.z)) {
           activeHitbox.hitTargets.add(bot.id);
           const dx = bot.x - this.player.x;
           const dz = bot.z - this.player.z;
@@ -1352,11 +1812,43 @@ class MazeRoyaleApp {
         }
       }
 
-      if (this.gameMode !== 'coop') {
+      // Colpo al Bot Rivale (Cubo Rosso) in 1v1 vs Bot
+      if (this.gameMode === 'duel_bot' && this.rivalBot && this.rivalBot.alive && !activeHitbox.hitTargets.has(this.rivalBot.id)) {
+        const d = Math.hypot(this.rivalBot.x - activeHitbox.x, this.rivalBot.z - activeHitbox.z);
+        if (d <= activeHitbox.radius + CONFIG.PLAYER_RADIUS && hasLineOfSight(this.maze, this.player.x, this.player.z, this.rivalBot.x, this.rivalBot.z)) {
+          activeHitbox.hitTargets.add(this.rivalBot.id);
+          const dx = this.rivalBot.x - this.player.x;
+          const dz = this.rivalBot.z - this.player.z;
+          const pushX = Math.hypot(dx, dz) > 0.01 ? dx : Math.sin(this.player.rotY);
+          const pushZ = Math.hypot(dx, dz) > 0.01 ? dz : Math.cos(this.player.rotY);
+          const res = this.rivalBot.takeDamage(activeHitbox.damage, pushX, pushZ, this.maze);
+          if (res.blocked) {
+            audio.playShieldBlock();
+            this.controls.rumble(60, 0.25, 0.15);
+            this.showToast('🛡️ Il Cubo Rosso ha parato il colpo!');
+          } else {
+            audio.playHit();
+            this.controls.rumble(105, 0.3, 0.6);
+            if (res.died) {
+              this.rivalKills += 1;
+              this.player.hp = Math.min(this.player.maxHp, this.player.hp + CONFIG.RIVAL_KILL_HEAL);
+              this.showToast(`⚔️ Cubo Rosso eliminato! (+${CONFIG.RIVAL_KILL_HEAL} HP — segnalini caduti)`);
+            }
+          }
+        }
+      }
+
+      // Colpo al Rivale Online in 1v1 Online (controllo distanza sia raw packet che interpolata + LoS)
+      if (this.gameMode !== 'coop' && this.gameMode !== 'duel_bot') {
         for (const [pid, remote] of this.network.remotePlayers.entries()) {
           if (!remote.alive || activeHitbox.hitTargets.has(pid)) continue;
-          const d = Math.hypot(remote.x - activeHitbox.x, remote.z - activeHitbox.z);
-          if (d <= activeHitbox.radius + CONFIG.PLAYER_RADIUS) {
+          const visPos = this.remoteVisuals.get(pid)?.getWorldPosition();
+          const dRaw = Math.hypot(remote.x - activeHitbox.x, remote.z - activeHitbox.z);
+          const dVis = visPos ? Math.hypot(visPos.x - activeHitbox.x, visPos.z - activeHitbox.z) : dRaw;
+          const d = Math.min(dRaw, dVis);
+          const tx = visPos ? visPos.x : remote.x;
+          const tz = visPos ? visPos.z : remote.z;
+          if (d <= activeHitbox.radius + CONFIG.PLAYER_RADIUS && hasLineOfSight(this.maze, this.player.x, this.player.z, tx, tz)) {
             activeHitbox.hitTargets.add(pid);
             this.network.sendHit(pid, activeHitbox.damage, this.player.x, this.player.z);
             audio.playHit();
@@ -1366,7 +1858,7 @@ class MazeRoyaleApp {
       }
     }
 
-    // Raccolta dei 5 fogli sul pavimento (condivisi in Co-op!)
+    // Raccolta dei 5 fogli sul pavimento (condivisi in Co-op, PRIVATI in 1v1 e Singleplayer!)
     if (this.player.alive) {
       for (const wp of this.pages) {
         wp.update(dt, this.elapsedSec, this.maze, this.player);
@@ -1378,13 +1870,13 @@ class MazeRoyaleApp {
             symbol: wp.symbol
           }, false);
           audio.playPagePickup();
-          this.network.publishPageEvent({
-            action: 'PICKUP',
-            index: wp.originalIndex,
-            slot: wp.slot,
-            symbol: wp.symbol
-          });
           if (this.gameMode === 'coop') {
+            this.network.publishPageEvent({
+              action: 'PICKUP',
+              index: wp.originalIndex,
+              slot: wp.slot,
+              symbol: wp.symbol
+            });
             this.network.publishFullRoomSync(this._buildRoomSnapshot());
           }
           this.showToast(`Foglio #${wp.slot} raccolto: ${wp.symbol}`);
@@ -1399,28 +1891,90 @@ class MazeRoyaleApp {
       ch.updateVisibility(this.maze, this.player);
     }
 
-    // Bot verdi lenti: si vedono e attaccano ANCHE mentre il giocatore inserisce il codice del portale!
-    for (const bot of this.bots) {
-      bot.update(dt, this.maze, this.player, (dmg) => {
-        const lastPagesCount = this.player.collectedPages.length;
-        const res = this.player.takeDamage(
-          dmg,
-          this.maze,
-          this.gameMode === 'coop'
-            ? null
-            : (dropped) => {
-                this._dropPagesToWorld(dropped, false);
-              }
-        );
-        if (res.blocked) {
-          this.controls.rumble(65, 0.35, 0.2);
-          this.showToast('Attacco bloccato dallo Scudo!');
-        } else {
-          this.controls.rumble(140, 0.35, 0.75);
-          this._triggerDamageFlash();
-          if (res.died) this._onPlayerDied(lastPagesCount);
+    // Aggiornamento Bot Rivale 1v1 (Cubo Rosso con segnalini sdoppiati privati + duello)
+    if (this.gameMode === 'duel_bot' && this.rivalBot) {
+      this.rivalBot.update(dt, this.maze, this.player, this.chests, this.bots, {
+        onAttackPlayer: (dmg, bot) => {
+          this._applyPlayerDamage(dmg, bot.x, bot.z, 'Cubo Rosso (BOT)');
+        },
+        onCollectPage: (bp, bot) => {
+          this.showToast(`🟥 Il Cubo Rosso ha trovato un segnalino! (${bot.collectedPages.length}/5)`);
+        },
+        onPortalUnlockStart: () => {
+          audio.playPunish();
+          this.showToast('⚠️ ALLERTA! Il Cubo Rosso sta sbloccando il Portale al centro!');
+        },
+        onPortalUnlocked: () => {
+          if (this.screenState === 'PLAYING') {
+            audio.playPunish();
+            this._onDuelFinished(false, 'Cubo Rosso (BOT)');
+          }
+        },
+        onRespawn: () => {
+          this.showToast('🟥 Il Cubo Rosso è rientrato allo Spawn B!');
         }
       });
+
+      // Separazione fisica Cubo Blu vs Cubo Rosso per combattimenti corpo a corpo puliti
+      if (this.player.alive && this.rivalBot.alive) {
+        const sepDx = this.player.x - this.rivalBot.x;
+        const sepDz = this.player.z - this.rivalBot.z;
+        const sepDist = Math.hypot(sepDx, sepDz);
+        const minSep = CONFIG.PLAYER_RADIUS * 1.92;
+        if (sepDist < minSep) {
+          const nx = sepDist > 1e-4 ? sepDx / sepDist : 1;
+          const nz = sepDist > 1e-4 ? sepDz / sepDist : 0;
+          const pushHalf = (minSep - sepDist) * 0.5;
+          const pNext = resolveMazeCollision(
+            this.maze,
+            this.player.x,
+            this.player.z,
+            this.player.x + nx * pushHalf,
+            this.player.z + nz * pushHalf,
+            CONFIG.PLAYER_RADIUS
+          );
+          this.player.x = pNext.x;
+          this.player.z = pNext.z;
+          this.player.syncTransform();
+
+          const bNext = resolveMazeCollision(
+            this.maze,
+            this.rivalBot.x,
+            this.rivalBot.z,
+            this.rivalBot.x - nx * pushHalf,
+            this.rivalBot.z - nz * pushHalf,
+            CONFIG.PLAYER_RADIUS
+          );
+          this.rivalBot.x = bNext.x;
+          this.rivalBot.z = bNext.z;
+          this.rivalBot.group.position.set(this.rivalBot.x, 0, this.rivalBot.z);
+        }
+      }
+    }
+
+    // Bot verdi lenti: si vedono e attaccano ANCHE mentre il giocatore inserisce il codice del portale!
+    for (const bot of this.bots) {
+      bot.update(
+        dt,
+        this.maze,
+        this.player,
+        (dmg, b) => {
+          this._applyPlayerDamage(dmg, b.x, b.z, 'Guardiano del Labirinto');
+        },
+        this.gameMode === 'duel_bot' ? this.rivalBot : null,
+        (dmg, b) => {
+          if (!this.rivalBot || !this.rivalBot.alive) return;
+          const res = this.rivalBot.takeDamage(
+            dmg,
+            this.rivalBot.x - b.x,
+            this.rivalBot.z - b.z,
+            this.maze
+          );
+          if (res.died) {
+            this.showToast('🟩 Un Guardiano ha abbattuto il Cubo Rosso! Respawn tra 3s');
+          }
+        }
+      );
     }
 
     // Controllo raggio < 3 per mostrare/nascondere il tasto Interagisci (Viola)
@@ -1482,8 +2036,61 @@ class MazeRoyaleApp {
     const aliveBots = this.bots.filter((b) => b.alive).length;
     const peers = this.network.remotePlayers.size;
     const padTxt = this.controls.gamepad.connected ? ' • 🎮 Pad' : '';
-    const modeTxt = this.gameMode === 'coop' ? ` • Co-op:${peers + 1}` : '';
+    let modeTxt = '';
+    if (this.gameMode === 'coop') {
+      modeTxt = ` • Co-op:${peers + 1}`;
+    } else if (this.gameMode === 'duel_bot') {
+      modeTxt = ` • Duello 1v1:${this.rivalKills}`;
+    } else if (this.gameMode === 'duel_online') {
+      modeTxt = ` • 1v1:${peers + 1}/2 (KO:${this.rivalKills})`;
+    }
     this.el.statsLine.textContent = `Spada: ${this.player.swordDamage} DMG • Bot: ${aliveBots}${modeTxt}${padTxt}`;
+
+    if (this.el.rivalHud) {
+      const isDuel = this.isDuelMode();
+      this.el.rivalHud.classList.toggle('hidden', !isDuel);
+      if (isDuel) {
+        if (this.gameMode === 'duel_bot' && this.rivalBot) {
+          const hpPct = Math.max(0, Math.min(100, (this.rivalBot.hp / this.rivalBot.maxHp) * 100));
+          if (this.el.rivalHudLabel) this.el.rivalHudLabel.textContent = '🟥 BOT';
+          if (this.el.rivalHudPages) this.el.rivalHudPages.textContent = `${this.rivalBot.collectedPages.length}/5`;
+          if (this.el.rivalHpFill) this.el.rivalHpFill.style.width = `${hpPct}%`;
+          if (this.rivalBot.unlockingDoorTimer > 0) {
+            this.el.rivalHud.classList.add('portal-alert');
+            if (this.el.rivalHudState) this.el.rivalHudState.textContent = '⚠️ PORTALE!';
+          } else {
+            this.el.rivalHud.classList.remove('portal-alert');
+            if (this.el.rivalHudState) {
+              this.el.rivalHudState.textContent = this.rivalBot.alive
+                ? `${Math.ceil(this.rivalBot.hp)} HP`
+                : `RESPAWN ${Math.max(1, Math.ceil(this.rivalBot.respawnTimer))}s`;
+            }
+          }
+        } else if (this.gameMode === 'duel_online') {
+          const remote = [...this.network.remotePlayers.values()][0];
+          if (!remote) {
+            this.el.rivalHud.classList.remove('portal-alert');
+            if (this.el.rivalHudLabel) this.el.rivalHudLabel.textContent = '🟥 1V1';
+            if (this.el.rivalHudPages) this.el.rivalHudPages.textContent = '0/5';
+            if (this.el.rivalHpFill) this.el.rivalHpFill.style.width = '0%';
+            if (this.el.rivalHudState) this.el.rivalHudState.textContent = 'ATTESA...';
+          } else {
+            const maxHp = Math.max(1, remote.maxHp || CONFIG.PLAYER_MAX_HP);
+            const hpPct = Math.max(0, Math.min(100, ((remote.hp ?? maxHp) / maxHp) * 100));
+            const atPortal = (remote.pagesCount ?? 0) >= 5 && remote.alive && Math.hypot(remote.x || 0, remote.z || 0) < 3.5;
+            this.el.rivalHud.classList.toggle('portal-alert', atPortal);
+            if (this.el.rivalHudLabel) this.el.rivalHudLabel.textContent = '🟥 RIVALE';
+            if (this.el.rivalHudPages) this.el.rivalHudPages.textContent = `${remote.pagesCount ?? 0}/5`;
+            if (this.el.rivalHpFill) this.el.rivalHpFill.style.width = `${hpPct}%`;
+            if (this.el.rivalHudState) {
+              this.el.rivalHudState.textContent = atPortal
+                ? '⚠️ PORTALE!'
+                : (remote.alive ? `${Math.ceil(remote.hp ?? maxHp)} HP` : 'RESPAWN');
+            }
+          }
+        }
+      }
+    }
 
     if (this.doorModalOpen && this.el.doorHint) {
       this.el.doorHint.textContent = `⚠️ ATTENZIONE: i Guardiani ti attaccano mentre scrivi! • ❤️ ${Math.ceil(this.player.hp)}/${this.player.maxHp} HP • Fogli: ${this.player.collectedPages.length}/5`;
