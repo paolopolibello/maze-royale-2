@@ -1,6 +1,6 @@
 {
-  "name": "Maze Royale - Dark Labyrinth",
-  "short_name": "Maze Royale",
+  "name": "Maze Royale 2 - Dark Labyrinth",
+  "short_name": "Maze Royale 2",
   "start_url": "./index.html",
   "scope": "./",
   "display": "fullscreen",

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'maze-royale-v15';
+const CACHE_NAME = 'maze-royale-2-v15';
 const ASSETS = [
   './',
   './index.html',
@@ -30,7 +30,7 @@ self.addEventListener('install', (e) => {
 
 self.addEventListener('activate', (e) => {
   e.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
+    caches.keys().then((keys) => Promise.all(keys.filter((k) => k.startsWith('maze-royale-2-') && k !== CACHE_NAME).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
