@@ -35,7 +35,7 @@
       visibility: hidden;
     }
   </style>
-  <link rel="stylesheet" href="./style.css?v=15" />
+  <link rel="stylesheet" href="./style.css?v=16" />
 </head>
 
 <body>
@@ -43,8 +43,8 @@
   <script>
     (function () {
       var isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
-      if (isLocal && 'serviceWorker' in navigator && navigator.serviceWorker.controller && !sessionStorage.getItem('sw_cleared_v15')) {
-        sessionStorage.setItem('sw_cleared_v15', '1');
+      if (isLocal && 'serviceWorker' in navigator && navigator.serviceWorker.controller && !sessionStorage.getItem('sw_cleared_v16')) {
+        sessionStorage.setItem('sw_cleared_v16', '1');
         navigator.serviceWorker.getRegistrations().then(function (regs) {
           Promise.all(regs.map(function (r) { return r.unregister(); })).then(function () {
             if (window.caches) {
@@ -64,7 +64,7 @@
 
   <!-- 1. Schermata di Caricamento Fullscreen (5s garantiti) -->
   <div id="loading-screen" class="loading-screen" aria-label="Caricamento in corso">
-    <img id="loading-bg" class="loading-bg" src="./assets/loading-bg.jpg?v=15" alt="Maze Royale Splash" />
+    <img id="loading-bg" class="loading-bg" src="./assets/loading-bg.jpg?v=16" alt="Maze Royale Splash" />
     <div class="loading-vignette"></div>
     <div class="loading-bar-wrap">
       <div class="loading-header">
@@ -86,13 +86,16 @@
       <h1 class="menu-title">MAZE ROYALE</h1>
       <div class="menu-subtitle">DARK LABYRINTH</div>
       <p class="menu-desc">
-        Esplora il labirinto oscuro, trova i tuoi 5 simboli privati (o coopera in Co-op), combatti contro il Cubo Rosso
-        rivale e sblocca per primo la porta centrale!
+        Esplora il labirinto oscuro, trova i 5 simboli (da solo, in Co-op contro una squadra di Bot Rossi pari al vostro
+        numero o in 1v1) e sblocca per primo la porta centrale!
       </p>
 
       <div class="menu-buttons">
         <button id="btn-menu-duel-bot" type="button" class="menu-btn duel-bot">
           ⚔️ 1 VS 1 — CONTRO BOT RIVALE
+        </button>
+        <button id="btn-menu-coop-bots" type="button" class="menu-btn coop-bots">
+          🛡️ CO-OP VS BOT RIVALI (N vs N)
         </button>
         <button id="btn-menu-duel-online" type="button" class="menu-btn duel-online">
           🔥 1 VS 1 ONLINE (CODICE)
@@ -356,7 +359,7 @@
     }
   </script>
   <script src="./vendor/peerjs.min.js"></script>
-  <script type="module" src="./js/main.js?v=15"></script>
+  <script type="module" src="./js/main.js?v=16"></script>
 </body>
 
 </html>

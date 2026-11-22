@@ -38,6 +38,9 @@ export class RealtimeNetwork {
     this.unsubFns = [];
     this.syncAccum = 0;
     this._stateSeq = 0;
+    this._botSyncAccum = 0;
+    this._botStateSeq = 0;
+    this._lastBotStateSeq = -1;
     this._prevPubPos = null;
     this._prevPubMs = 0;
     this.processedHits = new Set();
@@ -310,7 +313,7 @@ export class RealtimeNetwork {
       } catch (_) {}
     }
 
-    if (msg.type === 'STATE') {
+    if (msg.type === 'STATE' || msg.type === 'RIVAL_BOTS_STATE') {
       // Usa il canale veloce 'pos' se aperto; fallback su 'ctrl'
       const posTargets = [];
       const fallbackTargets = [];
@@ -362,7 +365,7 @@ export class RealtimeNetwork {
             try { conn.send(msg); } catch (_) {}
           }
         }
-      } else if (['PAGE_EVENT', 'CHEST_OPENED', 'LEVEL_ADVANCE', 'DUEL_WIN', 'DUEL_RESET', 'HIT', 'HIT_RESULT', 'BYE'].includes(msg.type)) {
+      } else if (['PAGE_EVENT', 'CHEST_OPENED', 'LEVEL_ADVANCE', 'DUEL_WIN', 'DUEL_RESET', 'HIT', 'HIT_RESULT', 'BOT_HIT_RESULT', 'BOT_EVENT', 'BYE'].includes(msg.type)) {
         for (const conn of this.peerConns) {
           if (conn !== sourceConn && conn.open && conn.label !== 'pos') {
             try { conn.send(msg); } catch (_) {}
@@ -385,6 +388,32 @@ export class RealtimeNetwork {
       }
       this.remotePlayers.set(msg.state.id, { ...msg.state, lastSeen: Date.now() });
       this.handlers.onPlayersUpdate?.(this.remotePlayers);
+    } else if (msg.type === 'RIVAL_BOTS_STATE') {
+      const st = msg.state;
+      if (!st) return;
+      if (typeof st.seq === 'number') {
+        if (st.seq <= this._lastBotStateSeq) return;
+        this._lastBotStateSeq = st.seq;
+      }
+      this.handlers.onRivalBotsState?.(st);
+    } else if (msg.type === 'BOT_HIT') {
+      if (this.coopRole === 'host' && msg.botId && !this.processedHits.has(msg.hitId)) {
+        this.processedHits.add(msg.hitId);
+        this.handlers.onBotHit?.(msg);
+      }
+    } else if (msg.type === 'BOT_HIT_RESULT' && msg.targetId === this.playerId) {
+      const rk = `bhr_${msg.eid || msg.hitId || Date.now()}`;
+      if (!this.processedEvents.has(rk)) {
+        this.processedEvents.add(rk);
+        this.handlers.onBotHitResult?.(msg);
+      }
+    } else if (msg.type === 'BOT_EVENT') {
+      const eid = msg.event?.eid;
+      if (eid) {
+        if (this.processedEvents.has(eid)) return;
+        this.processedEvents.add(eid);
+      }
+      this.handlers.onBotEvent?.(msg.event);
     } else if (msg.type === 'BYE') {
       this.remotePlayers.delete(msg.from);
       this.handlers.onPlayersUpdate?.(this.remotePlayers);
@@ -524,6 +553,49 @@ export class RealtimeNetwork {
           this.processedEvents.add(ev.lastChest.eid);
           this.handlers.onChestOpened?.(ev.lastChest.chestId);
         }
+        if (ev.botEvent && ev.botEvent.from !== this.playerId && !this.processedEvents.has(ev.botEvent.eid)) {
+          this.processedEvents.add(ev.botEvent.eid);
+          this.handlers.onBotEvent?.(ev.botEvent);
+        }
+      })
+    );
+
+    if (this.coopRole === 'guest') {
+      const rivalBotsRef = dbMod.ref(db, `${base}/rivalBots`);
+      this.unsubFns.push(
+        dbMod.onValue(rivalBotsRef, (snap) => {
+          const st = snap.val();
+          if (st) this.handlers.onRivalBotsState?.(st);
+        })
+      );
+    } else if (this.coopRole === 'host') {
+      const botHitsRef = dbMod.ref(db, `${base}/botHits`);
+      this.unsubFns.push(
+        dbMod.onValue(botHitsRef, (snap) => {
+          const hits = snap.val();
+          if (!hits) return;
+          for (const [hitId, payload] of Object.entries(hits)) {
+            if (this.processedHits.has(hitId)) continue;
+            this.processedHits.add(hitId);
+            this.handlers.onBotHit?.(payload);
+            dbMod.remove(dbMod.ref(db, `${base}/botHits/${hitId}`)).catch(() => null);
+          }
+        })
+      );
+    }
+
+    const myBotHitResRef = dbMod.ref(db, `${base}/botHitResults/${this.playerId}`);
+    this.unsubFns.push(
+      dbMod.onValue(myBotHitResRef, (snap) => {
+        const resMap = snap.val();
+        if (!resMap) return;
+        for (const [eid, payload] of Object.entries(resMap)) {
+          const rk = `bhr_${eid}`;
+          if (this.processedEvents.has(rk)) continue;
+          this.processedEvents.add(rk);
+          this.handlers.onBotHitResult?.(payload);
+          dbMod.remove(dbMod.ref(db, `${base}/botHitResults/${this.playerId}/${eid}`)).catch(() => null);
+        }
       })
     );
   }
@@ -593,15 +665,72 @@ export class RealtimeNetwork {
     }
   }
 
-  sendHit(targetId, damage, fromX, fromZ) {
+  sendHit(targetId, damage, fromX, fromZ, extra = {}) {
     if (this.coopRole === 'solo') return;
     const hitId = `${this.playerId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const payload = { hitId, targetId, fromId: this.playerId, damage, fromX, fromZ, at: Date.now() };
+    const payload = { hitId, targetId, fromId: this.playerId, damage, fromX, fromZ, ...extra, at: Date.now() };
     if (this.mode === 'firebase' && this.fbDb) {
       const { ref, set } = this.fbApi;
       set(ref(this.fbDb, `rooms/${this.roomId}/hits/${targetId}/${hitId}`), payload).catch(() => null);
     } else {
       this._broadcastLocalAndP2P({ type: 'HIT', from: this.playerId, ...payload });
+    }
+  }
+
+  publishRivalBotsState(dt, statePayload) {
+    if (this.coopRole !== 'host' || !statePayload) return;
+    this._botSyncAccum += dt;
+    const interval = this.mode === 'firebase' ? 0.1 : 0.04;
+    if (this._botSyncAccum < interval) return;
+    this._botSyncAccum = 0;
+
+    this._botStateSeq += 1;
+    const payload = {
+      ...statePayload,
+      seq: this._botStateSeq,
+      updatedAt: Date.now()
+    };
+
+    if (this.mode === 'firebase' && this.fbDb) {
+      const { ref, set } = this.fbApi;
+      set(ref(this.fbDb, `rooms/${this.roomId}/rivalBots`), payload).catch(() => null);
+    } else {
+      this._broadcastLocalAndP2P({ type: 'RIVAL_BOTS_STATE', from: this.playerId, state: payload });
+    }
+  }
+
+  sendBotHit(botId, damage, fromX, fromZ) {
+    if (this.coopRole === 'solo') return;
+    const hitId = `${this.playerId}_bh_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const payload = { hitId, botId, fromId: this.playerId, damage, fromX, fromZ, at: Date.now() };
+    if (this.mode === 'firebase' && this.fbDb) {
+      const { ref, set } = this.fbApi;
+      set(ref(this.fbDb, `rooms/${this.roomId}/botHits/${hitId}`), payload).catch(() => null);
+    } else {
+      this._broadcastLocalAndP2P({ type: 'BOT_HIT', from: this.playerId, ...payload });
+    }
+  }
+
+  sendBotHitResult(targetId, result = {}) {
+    if (this.coopRole === 'solo') return;
+    const eid = `${this.playerId}_bhr_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+    const payload = { ...result, eid, targetId, fromId: this.playerId, at: Date.now() };
+    if (this.mode === 'firebase' && this.fbDb) {
+      const { ref, set } = this.fbApi;
+      set(ref(this.fbDb, `rooms/${this.roomId}/botHitResults/${targetId}/${eid}`), payload).catch(() => null);
+    } else {
+      this._broadcastLocalAndP2P({ type: 'BOT_HIT_RESULT', from: this.playerId, ...payload });
+    }
+  }
+
+  publishBotEvent(event) {
+    if (this.coopRole === 'solo' || !event) return;
+    const payload = { ...event, eid: `${this.playerId}_be_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`, from: this.playerId, at: Date.now() };
+    if (this.mode === 'firebase' && this.fbDb) {
+      const { ref, set } = this.fbApi;
+      set(ref(this.fbDb, `rooms/${this.roomId}/worldEvents/botEvent`), payload).catch(() => null);
+    } else {
+      this._broadcastLocalAndP2P({ type: 'BOT_EVENT', from: this.playerId, event: payload });
     }
   }
 
@@ -617,7 +746,7 @@ export class RealtimeNetwork {
     }
   }
 
-  publishDuelWin(level, winnerName, winnerPages = 5, winnerKills = 0) {
+  publishDuelWin(level, winnerName, winnerPages = 5, winnerKills = 0, extra = {}) {
     if (this.coopRole === 'solo') return;
     const eventId = `${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
     const duelWinner = {
@@ -626,24 +755,25 @@ export class RealtimeNetwork {
       winnerPages,
       winnerKills,
       level,
-      eventId
+      eventId,
+      ...extra
     };
     if (this.mode === 'firebase' && this.fbDb) {
       const { ref, set } = this.fbApi;
-      const baseSnap = this._lastSnapshot || { level, seed: 0, gameMode: 'duel_online', collectedPages: [], openedChests: [] };
+      const baseSnap = this._lastSnapshot || { level, seed: 0, gameMode: extra.gameMode || 'duel_online', collectedPages: [], openedChests: [] };
       set(ref(this.fbDb, `rooms/${this.roomId}/meta`), { ...baseSnap, duelWinner, updatedAt: Date.now() }).catch(() => null);
     } else {
       this._broadcastLocalAndP2P({ type: 'DUEL_WIN', from: this.playerId, ...duelWinner });
     }
   }
 
-  publishDuelReset(level, seed) {
+  publishDuelReset(level, seed, gameMode = 'duel_online') {
     if (this.coopRole === 'solo') return;
     const resetId = `${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
     const snapshot = {
       level,
       seed,
-      gameMode: 'duel_online',
+      gameMode,
       collectedPages: [],
       openedChests: [],
       victory: false,
@@ -657,7 +787,7 @@ export class RealtimeNetwork {
       const { ref, set } = this.fbApi;
       set(ref(this.fbDb, `rooms/${this.roomId}/meta`), { ...snapshot, updatedAt: Date.now() }).catch(() => null);
     } else {
-      this._broadcastLocalAndP2P({ type: 'DUEL_RESET', from: this.playerId, level, seed });
+      this._broadcastLocalAndP2P({ type: 'DUEL_RESET', from: this.playerId, level, seed, gameMode });
     }
   }
 
@@ -719,6 +849,7 @@ export class RealtimeNetwork {
     clearTimeout(this._retryTimer);
     this._retryTimer = null;
     this._lastSnapshot = null;
+    this._lastBotStateSeq = -1;
 
     for (const u of this.unsubFns) {
       try { u(); } catch (_) {}
@@ -728,6 +859,9 @@ export class RealtimeNetwork {
     if (this.mode === 'firebase' && this.fbDb && this.fbApi) {
       const { ref, remove } = this.fbApi;
       remove(ref(this.fbDb, `rooms/${this.roomId}/players/${this.playerId}`)).catch(() => null);
+      if (this.coopRole === 'host') {
+        remove(ref(this.fbDb, `rooms/${this.roomId}/rivalBots`)).catch(() => null);
+      }
     }
 
     this._broadcastLocalAndP2P({ type: 'BYE', from: this.playerId });

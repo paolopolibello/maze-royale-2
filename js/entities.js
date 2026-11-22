@@ -218,7 +218,7 @@ export class EnemyBot {
     scene.add(this.group);
   }
 
-  update(dt, maze, player, onAttackPlayer, rivalTarget = null, onAttackRival = null) {
+  update(dt, maze, player, onAttackPlayer, rivalTargets = null, onAttackRival = null) {
     if (!this.alive) {
       this.group.visible = false;
       this.visibleToPlayer = false;
@@ -237,31 +237,37 @@ export class EnemyBot {
     this.visibleToPlayer = playerLit;
     this.group.visible = playerLit;
 
-    const rivalLit = Boolean(
-      rivalTarget &&
-      rivalTarget.alive &&
-      isIlluminatedWithLoS(maze, rivalTarget.x, rivalTarget.z, this.x, this.z, CONFIG.TORCH_RANGE * 0.78)
-    );
+    const rivalList = Array.isArray(rivalTargets) ? rivalTargets : (rivalTargets ? [rivalTargets] : []);
+    let nearestRival = null;
+    let dRival = Infinity;
+    for (const rv of rivalList) {
+      if (!rv || !rv.alive) continue;
+      if (!isIlluminatedWithLoS(maze, rv.x, rv.z, this.x, this.z, CONFIG.TORCH_RANGE * 0.78)) continue;
+      const d = Math.hypot(rv.x - this.x, rv.z - this.z);
+      if (d < dRival) {
+        dRival = d;
+        nearestRival = rv;
+      }
+    }
 
     const dPlayer = playerLit ? Math.hypot(player.x - this.x, player.z - this.z) : Infinity;
-    const dRival = rivalLit ? Math.hypot(rivalTarget.x - this.x, rivalTarget.z - this.z) : Infinity;
 
     let chaseTarget = null;
     let chaseAttackCb = null;
-    if (playerLit && rivalLit) {
+    if (playerLit && nearestRival) {
       if (dPlayer <= dRival) {
         chaseTarget = player;
         chaseAttackCb = onAttackPlayer;
       } else {
-        chaseTarget = rivalTarget;
-        chaseAttackCb = onAttackRival;
+        chaseTarget = nearestRival;
+        chaseAttackCb = (dmg, bot) => onAttackRival?.(dmg, bot, nearestRival);
       }
     } else if (playerLit) {
       chaseTarget = player;
       chaseAttackCb = onAttackPlayer;
-    } else if (rivalLit) {
-      chaseTarget = rivalTarget;
-      chaseAttackCb = onAttackRival;
+    } else if (nearestRival) {
+      chaseTarget = nearestRival;
+      chaseAttackCb = (dmg, bot) => onAttackRival?.(dmg, bot, nearestRival);
     }
 
     this.aware = Boolean(chaseTarget);

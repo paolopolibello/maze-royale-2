@@ -95,13 +95,20 @@ export function findMazePath(maze, startGx, startGz, goalGx, goalGz) {
  * - Invisibile nel buio o dietro ai muri (regola ferrea Torcia + LoS)
  */
 export class RivalBot {
-  constructor(maze, scene) {
-    this.id = 'rival-bot';
-    this.name = 'Cubo Rosso (BOT)';
+  constructor(maze, scene, opts = {}) {
+    this.id = opts.id || 'rival-bot';
+    this.botIndex = Number(opts.botIndex) || 0;
+    this.name = opts.name || (this.botIndex > 0 ? `Cubo Rosso #${this.botIndex + 1}` : 'Cubo Rosso (BOT)');
     this.maze = maze;
 
-    this.x = maze.spawnB.x;
-    this.z = maze.spawnB.z;
+    this.homeSpawn = this.botIndex === 0
+      ? { x: maze.spawnB.x, z: maze.spawnB.z }
+      : findSafeDropPosition(maze, maze.spawnB.x, maze.spawnB.z, 1.35, this.botIndex * 1.35);
+
+    this.x = this.homeSpawn.x;
+    this.z = this.homeSpawn.z;
+    this.vx = 0;
+    this.vz = 0;
     this.rotY = Math.PI;
     this.maxHp = CONFIG.PLAYER_MAX_HP;
     this.hp = CONFIG.PLAYER_MAX_HP;
@@ -126,36 +133,39 @@ export class RivalBot {
     this.stunTimer = 0;
     this.visibleToPlayer = false;
 
-    // 5 segnalini duplicati perfettamente sovrapposti alle coordinate del livello, SOLO lato bot
-    this.pages = maze.pageSpawns.map((p) => ({
-      originalIndex: p.index,
-      slot: p.slot,
-      symbol: p.symbol,
-      x: p.x,
-      z: p.z,
-      collected: false
-    }));
+    // Pool dei 5 segnalini privati del Team Rosso (duplicato/condiviso tra i bot rivali se opts.sharedPages e' passato)
+    this.pages = Array.isArray(opts.sharedPages)
+      ? opts.sharedPages
+      : maze.pageSpawns.map((p) => ({
+          originalIndex: p.index,
+          slot: p.slot,
+          symbol: p.symbol,
+          x: p.x,
+          z: p.z,
+          collected: false,
+          collectedBy: null
+        }));
     this.collectedPages = [];
 
     // Stato navigazione e combattimento
-    this.exploreTargets = this._buildExploreQueue(maze);
+    this.exploreTargets = this._buildExploreQueue(maze, this.botIndex);
     this.visitedCells = new Set();
     this.currentPath = [];
-    this.pathRecalcTimer = 0;
-    this.searchHintTimer = Math.max(5.5, 9.0 - (maze.level || 1) * 0.6);
+    this.pathRecalcTimer = (this.botIndex % 4) * 0.14;
+    this.searchHintTimer = Math.max(5.5, 9.0 - (maze.level || 1) * 0.6) + (this.botIndex % 3) * 0.85;
     this.stuckTimer = 0;
     this.lastCheckPos = { x: this.x, z: this.z };
     this.unlockingDoorTimer = 0;
     this.alertedDoor = false;
     this.combatMemoryTimer = 0;
     this.lastKnownPlayerPos = null;
-    this.strafeSign = Math.random() < 0.5 ? 1 : -1;
+    this.strafeSign = (this.botIndex % 2 === 0 ? 1 : -1) * (Math.random() < 0.7 ? 1 : -1);
     this.strafeFlipTimer = 1.6;
 
     this._buildMeshes(scene);
   }
 
-  _buildExploreQueue(maze) {
+  _buildExploreQueue(maze, offsetIdx = 0) {
     const queue = [];
     const seen = new Set();
     const pushTarget = (gx, gz) => {
@@ -165,8 +175,9 @@ export class RivalBot {
       queue.push({ gx, gz, ...maze.cellToWorld(gx, gz) });
     };
 
-    // Ordina le stanze (vicoli ciechi allargati) in modo avido partendo dallo Spawn B
+    // Ordina le stanze partendo dalla zona dello Spawn B; ruota l'ordine per ogni bot aggiuntivo cosi' si dividono subito
     const remainingRooms = [...(maze.rooms || [])];
+    const roomTargets = [];
     let curX = maze.spawnB.x;
     let curZ = maze.spawnB.z;
     while (remainingRooms.length > 0) {
@@ -181,15 +192,25 @@ export class RivalBot {
         }
       }
       const picked = remainingRooms.splice(bestIdx, 1)[0];
-      pushTarget(picked.gx, picked.gz);
+      roomTargets.push(picked);
       const pw = maze.cellToWorld(picked.gx, picked.gz);
       curX = pw.x;
       curZ = pw.z;
     }
 
-    // Celle distribuite come fallback esplorativo
-    for (let i = 0; i < maze.floorCells.length; i += 4) {
-      const fc = maze.floorCells[i];
+    if (roomTargets.length > 1 && offsetIdx > 0) {
+      const shift = (offsetIdx * 2) % roomTargets.length;
+      const rotated = roomTargets.slice(shift).concat(roomTargets.slice(0, shift));
+      for (const r of rotated) pushTarget(r.gx, r.gz);
+    } else {
+      for (const r of roomTargets) pushTarget(r.gx, r.gz);
+    }
+
+    // Celle distribuite come fallback esplorativo (sfalsate per indice bot)
+    const cells = maze.floorCells || [];
+    const startOffset = cells.length > 0 ? (offsetIdx * 3) % Math.max(1, cells.length) : 0;
+    for (let step = 0; step < cells.length; step += 4) {
+      const fc = cells[(startOffset + step) % cells.length];
       pushTarget(fc.gx, fc.gz);
     }
     return queue;
@@ -291,36 +312,65 @@ export class RivalBot {
     this.rotY += diff * Math.min(1, dt * rate);
   }
 
-  _pickNextObjectiveCell(maze, chests, player) {
-    // 1. Se ha tutti e 5 i suoi segnalini -> vai al Portale Centrale (0, 0)
-    if (this.collectedPages.length >= 5) {
+  getTeamCollectedCount() {
+    let count = 0;
+    for (const p of this.pages) {
+      if (p.collected) count += 1;
+    }
+    return count;
+  }
+
+  dispose(scene) {
+    if (scene && this.group) {
+      scene.remove(this.group);
+    }
+  }
+
+  _pickNextObjectiveCell(maze, chests, targetHuman, claimedPageIndices = null) {
+    // 1. Se il Team Rosso ha tutti e 5 i segnalini -> vai al Portale Centrale (0, 0)
+    if (this.getTeamCollectedCount() >= 5) {
       return { gx: maze.mid, gz: maze.mid };
     }
 
-    // 2. Segnalino non ancora raccolto direttamente visibile al Bot -> vallo a prendere subito!
-    let visibleBestPage = null;
-    let visibleBestDist = Infinity;
-    for (const bp of this.pages) {
-      if (bp.collected) continue;
-      const d = Math.hypot(bp.x - this.x, bp.z - this.z);
-      if (d <= CONFIG.TORCH_RANGE * 0.88 && hasLineOfSight(maze, this.x, this.z, bp.x, bp.z)) {
-        if (d < visibleBestDist) {
-          visibleBestDist = d;
-          visibleBestPage = bp;
+    const pickUncollectedPage = (requireLoS = false) => {
+      let bestUnclaimed = null;
+      let bestUnclaimedDist = Infinity;
+      let bestAny = null;
+      let bestAnyDist = Infinity;
+      for (const bp of this.pages) {
+        if (bp.collected) continue;
+        const d = Math.hypot(bp.x - this.x, bp.z - this.z);
+        if (requireLoS && (d > CONFIG.TORCH_RANGE * 0.88 || !hasLineOfSight(maze, this.x, this.z, bp.x, bp.z))) {
+          continue;
+        }
+        if (d < bestAnyDist) {
+          bestAnyDist = d;
+          bestAny = bp;
+        }
+        if (!claimedPageIndices || !claimedPageIndices.has(bp.originalIndex)) {
+          if (d < bestUnclaimedDist) {
+            bestUnclaimedDist = d;
+            bestUnclaimed = bp;
+          }
         }
       }
-    }
+      return bestUnclaimed || bestAny;
+    };
+
+    // 2. Segnalino non ancora raccolto direttamente visibile al Bot -> vallo a prendere subito!
+    const visibleBestPage = pickUncollectedPage(true);
     if (visibleBestPage) {
+      claimedPageIndices?.add(visibleBestPage.originalIndex);
       return maze.worldToCell(visibleBestPage.x, visibleBestPage.z);
     }
 
-    // 3. Se inseguiva la memoria dell'ultima posizione del giocatore
+    // 3. Se inseguiva la memoria dell'ultima posizione del giocatore umano
     if (this.combatMemoryTimer > 0 && this.lastKnownPlayerPos) {
       return maze.worldToCell(this.lastKnownPlayerPos.x, this.lastKnownPlayerPos.z);
     }
 
     // 4. Cassa loot visibile vicina (solo se utile e non sta finendo i 5 fogli)
-    if (this.collectedPages.length < 4 && chests) {
+    if (this.getTeamCollectedCount() < 4 && chests) {
       for (const ch of chests) {
         if (ch.opened) continue;
         const d = Math.hypot(ch.x - this.x, ch.z - this.z);
@@ -330,19 +380,11 @@ export class RivalBot {
       }
     }
 
-    // 5. Hint periodico verso il proprio segnalino piu' vicino se l'esplorazione si protrae
+    // 5. Hint periodico verso un segnalino libero se l'esplorazione si protrae
     if (this.searchHintTimer <= 0) {
-      let closestPage = null;
-      let closestDist = Infinity;
-      for (const bp of this.pages) {
-        if (bp.collected) continue;
-        const d = Math.hypot(bp.x - this.x, bp.z - this.z);
-        if (d < closestDist) {
-          closestDist = d;
-          closestPage = bp;
-        }
-      }
+      const closestPage = pickUncollectedPage(false);
       if (closestPage) {
+        claimedPageIndices?.add(closestPage.originalIndex);
         this.searchHintTimer = Math.max(5.0, 8.5 - (maze.level || 1) * 0.5) + Math.random() * 2.5;
         return maze.worldToCell(closestPage.x, closestPage.z);
       }
@@ -360,10 +402,13 @@ export class RivalBot {
       return { gx: next.gx, gz: next.gz };
     }
 
-    // Fallback finale: punta al primo segnalino residuo
-    const rem = this.pages.find((p) => !p.collected);
-    if (rem) return maze.worldToCell(rem.x, rem.z);
-    if (player && player.alive) return maze.worldToCell(player.x, player.z);
+    // Fallback finale: punta al primo segnalino residuo (preferibilmente non reclamato da un altro bot)
+    const rem = pickUncollectedPage(false);
+    if (rem) {
+      claimedPageIndices?.add(rem.originalIndex);
+      return maze.worldToCell(rem.x, rem.z);
+    }
+    if (targetHuman && targetHuman.alive) return maze.worldToCell(targetHuman.x, targetHuman.z);
     return { gx: maze.mid, gz: maze.mid };
   }
 
@@ -373,15 +418,17 @@ export class RivalBot {
     this.hitTargetsInSwing.clear();
   }
 
-  update(dt, maze, player, chests = [], greenBots = [], callbacks = {}) {
+  update(dt, maze, humanOrTargets, chests = [], greenBots = [], callbacks = {}, teamContext = null) {
     if (!this.alive) {
       this.group.visible = false;
       this.visibleToPlayer = false;
+      this.vx = 0;
+      this.vz = 0;
       if (this.respawnTimer > 0) {
         this.respawnTimer -= dt;
         if (this.respawnTimer <= 0) {
-          this.x = maze.spawnB.x;
-          this.z = maze.spawnB.z;
+          this.x = this.homeSpawn.x;
+          this.z = this.homeSpawn.z;
           this.rotY = Math.PI;
           this.hp = this.maxHp;
           this.alive = true;
@@ -405,6 +452,23 @@ export class RivalBot {
       }
       return;
     }
+
+    const targets = Array.isArray(humanOrTargets)
+      ? humanOrTargets.filter(Boolean)
+      : (humanOrTargets ? [{
+          id: 'local',
+          x: humanOrTargets.x,
+          z: humanOrTargets.z,
+          alive: humanOrTargets.alive,
+          attackTimer: humanOrTargets.attackTimer || 0,
+          attacking: (humanOrTargets.attackTimer || 0) > 0,
+          isLocal: true,
+          ref: humanOrTargets
+        }] : []);
+    const localViewer = teamContext?.localPlayer || targets.find((t) => t.isLocal) || targets[0] || null;
+    const claimedPageIndices = teamContext?.claimedPageIndices || null;
+    const prevX = this.x;
+    const prevZ = this.z;
 
     if (this.dashCooldown > 0) this.dashCooldown = Math.max(0, this.dashCooldown - dt);
     if (this.attackCooldown > 0) this.attackCooldown = Math.max(0, this.attackCooldown - dt);
@@ -431,11 +495,12 @@ export class RivalBot {
     const curCell = maze.worldToCell(this.x, this.z);
     this.visitedCells.add(`${curCell.gx},${curCell.gz}`);
 
-    // Raccolta PRIVATA dei propri 5 segnalini (non tocca quelli del giocatore!)
+    // Raccolta PRIVATA nel pool del Team Rosso (non tocca quelli degli umani!)
     for (const bp of this.pages) {
       if (bp.collected) continue;
       if (Math.hypot(bp.x - this.x, bp.z - this.z) < 1.55) {
         bp.collected = true;
+        bp.collectedBy = this.id;
         if (!this.collectedPages.some((c) => c.originalIndex === bp.originalIndex)) {
           this.collectedPages.push({
             originalIndex: bp.originalIndex,
@@ -468,17 +533,21 @@ export class RivalBot {
       }
     }
 
-    // Rilevamento giocatore blu entro linea di vista
-    const distToPlayer = player ? Math.hypot(player.x - this.x, player.z - this.z) : Infinity;
-    const canSeePlayer = Boolean(
-      player &&
-      player.alive &&
-      distToPlayer <= 13.5 &&
-      hasLineOfSight(maze, this.x, this.z, player.x, player.z)
-    );
+    // Rilevamento del giocatore umano vivo piu' vicino entro linea di vista
+    let activeTarget = null;
+    let distToPlayer = Infinity;
+    for (const t of targets) {
+      if (!t || !t.alive) continue;
+      const d = Math.hypot(t.x - this.x, t.z - this.z);
+      if (d <= 13.5 && d < distToPlayer && hasLineOfSight(maze, this.x, this.z, t.x, t.z)) {
+        distToPlayer = d;
+        activeTarget = t;
+      }
+    }
+    const canSeePlayer = Boolean(activeTarget);
     if (canSeePlayer) {
       this.combatMemoryTimer = 2.8;
-      this.lastKnownPlayerPos = { x: player.x, z: player.z };
+      this.lastKnownPlayerPos = { x: activeTarget.x, z: activeTarget.z };
     }
 
     // Eventuale guardiano verde vicino in LoS
@@ -495,20 +564,22 @@ export class RivalBot {
 
     let moveVx = 0;
     let moveVz = 0;
+    const teamPageCount = this.getTeamCollectedCount();
 
     if (this.stunTimer <= 0 && this.dashTimer <= 0) {
-      if (canSeePlayer && (this.collectedPages.length < 5 || distToPlayer < 8.5)) {
-        // Duello ravvicinato col giocatore blu!
-        const dirX = (player.x - this.x) / Math.max(0.001, distToPlayer);
-        const dirZ = (player.z - this.z) / Math.max(0.001, distToPlayer);
+      if (canSeePlayer && (teamPageCount < 5 || distToPlayer < 8.5)) {
+        // Duello ravvicinato col giocatore blu bersaglio!
+        const dirX = (activeTarget.x - this.x) / Math.max(0.001, distToPlayer);
+        const dirZ = (activeTarget.z - this.z) / Math.max(0.001, distToPlayer);
         this._rotateTowards(Math.atan2(dirX, dirZ), dt, 18);
 
         if (distToPlayer > 3.2) {
           this.unlockingDoorTimer = 0;
         }
 
-        // Scudo reattivo quando il giocatore sferra un colpo vicino
-        if (player.attackTimer > 0 && distToPlayer < 3.4 && this.shieldTimer <= 0 && this.attackTimer <= 0) {
+        // Scudo reattivo quando l'umano sferra un colpo vicino
+        const targetAttacking = Boolean(activeTarget.attacking || (activeTarget.attackTimer || 0) > 0);
+        if (targetAttacking && distToPlayer < 3.4 && this.shieldTimer <= 0 && this.attackTimer <= 0) {
           if (Math.random() < 0.5) {
             this.shieldTimer = 0.42;
           }
@@ -552,9 +623,9 @@ export class RivalBot {
           this._startAttack();
         }
 
-        // Ha tutti i 5 fogli e si trova al Portale (0, 0) -> Sblocca il codice!
+        // Il Team Rosso ha tutti e 5 i fogli e si trova al Portale (0, 0) -> Sblocca il codice!
         const distCenter = Math.hypot(this.x, this.z);
-        if (this.collectedPages.length >= 5 && distCenter < 2.2) {
+        if (teamPageCount >= 5 && distCenter < 2.2) {
           this._rotateTowards(Math.atan2(-this.x, -this.z), dt, 10);
           if (this.unlockingDoorTimer === 0 && !this.alertedDoor) {
             this.alertedDoor = true;
@@ -568,14 +639,14 @@ export class RivalBot {
             callbacks.onPortalUnlocked?.(this);
           }
         } else {
-          if (this.collectedPages.length < 5) {
+          if (teamPageCount < 5) {
             this.unlockingDoorTimer = 0;
             this.alertedDoor = false;
           }
 
-          // Navigazione BFS verso l'obiettivo corrente
+          // Navigazione BFS verso l'obiettivo corrente (coordinata su team via claimedPageIndices)
           if (this.pathRecalcTimer <= 0 || this.currentPath.length === 0) {
-            const goal = this._pickNextObjectiveCell(maze, chests, player);
+            const goal = this._pickNextObjectiveCell(maze, chests, activeTarget || localViewer, claimedPageIndices);
             this.currentPath = findMazePath(maze, curCell.gx, curCell.gz, goal.gx, goal.gz);
             this.pathRecalcTimer = 0.55;
           }
@@ -614,7 +685,7 @@ export class RivalBot {
       this.xrayMat.color.setHex(0xef4444);
     }
 
-    // Fendente spada attivo e rilevamento colpi verso giocatore & guardiani
+    // Fendente spada attivo e rilevamento colpi verso tutti i giocatori umani & guardiani
     if (this.attackTimer > 0) {
       this.attackTimer = Math.max(0, this.attackTimer - dt);
       const t = 1 - this.attackTimer / CONFIG.ATTACK_DURATION;
@@ -625,15 +696,21 @@ export class RivalBot {
       const hitX = this.x + Math.sin(this.rotY) * CONFIG.ATTACK_OFFSET_Z;
       const hitZ = this.z + Math.cos(this.rotY) * CONFIG.ATTACK_OFFSET_Z;
 
-      if (
-        player &&
-        player.alive &&
-        !this.hitTargetsInSwing.has('player') &&
-        Math.hypot(player.x - hitX, player.z - hitZ) <= CONFIG.ATTACK_RADIUS + CONFIG.PLAYER_RADIUS &&
-        hasLineOfSight(maze, this.x, this.z, player.x, player.z)
-      ) {
-        this.hitTargetsInSwing.add('player');
-        callbacks.onAttackPlayer?.(this.swordDamage, this);
+      for (const h of targets) {
+        if (!h || !h.alive) continue;
+        const hitKey = `human_${h.id || 'local'}`;
+        if (this.hitTargetsInSwing.has(hitKey)) continue;
+        if (
+          Math.hypot(h.x - hitX, h.z - hitZ) <= CONFIG.ATTACK_RADIUS + CONFIG.PLAYER_RADIUS &&
+          hasLineOfSight(maze, this.x, this.z, h.x, h.z)
+        ) {
+          this.hitTargetsInSwing.add(hitKey);
+          if (typeof callbacks.onAttackHuman === 'function') {
+            callbacks.onAttackHuman(h, this.swordDamage, this);
+          } else if (h.isLocal) {
+            callbacks.onAttackPlayer?.(this.swordDamage, this);
+          }
+        }
       }
 
       for (const gb of greenBots) {
@@ -710,11 +787,19 @@ export class RivalBot {
       this.lastCheckPos = { x: this.x, z: this.z };
     }
 
-    // Regola ferrea di visibilita': illuminato dalla torcia del giocatore + Line of Sight diretta
+    if (dt > 0.001) {
+      this.vx = Math.max(-35, Math.min(35, (this.x - prevX) / dt));
+      this.vz = Math.max(-35, Math.min(35, (this.z - prevZ) / dt));
+    } else {
+      this.vx = 0;
+      this.vz = 0;
+    }
+
+    // Regola ferrea di visibilita': illuminato dalla torcia del giocatore locale + Line of Sight diretta
     this.visibleToPlayer = Boolean(
-      player &&
-      player.alive &&
-      isIlluminatedWithLoS(maze, player.x, player.z, this.x, this.z, CONFIG.TORCH_RANGE)
+      localViewer &&
+      localViewer.alive &&
+      isIlluminatedWithLoS(maze, localViewer.x, localViewer.z, this.x, this.z, CONFIG.TORCH_RANGE)
     );
     this.group.visible = this.visibleToPlayer;
     this.group.position.set(this.x, 0, this.z);
@@ -725,10 +810,30 @@ export class RivalBot {
     this.hpBarFill.position.x = -(1 - hpPct) * 0.59;
   }
 
+  serializeState() {
+    return {
+      id: this.id,
+      idx: this.botIndex,
+      name: this.name,
+      x: Number(this.x.toFixed(3)),
+      z: Number(this.z.toFixed(3)),
+      vx: Number(this.vx.toFixed(2)),
+      vz: Number(this.vz.toFixed(2)),
+      rotY: Number(this.rotY.toFixed(3)),
+      hp: Math.round(this.hp),
+      maxHp: Math.round(this.maxHp),
+      shieldActive: this.shieldActive,
+      attacking: this.attackTimer > 0,
+      alive: this.alive,
+      respawnTimer: Number(this.respawnTimer.toFixed(2)),
+      unlocking: this.unlockingDoorTimer > 0
+    };
+  }
+
   takeDamage(amount, pushDirX = 0, pushDirZ = 0, maze = this.maze) {
-    if (!this.alive) return { blocked: false, died: false };
+    if (!this.alive) return { blocked: false, died: false, droppedCount: 0 };
     if (this.shieldActive) {
-      return { blocked: true, died: false };
+      return { blocked: true, died: false, droppedCount: 0 };
     }
 
     this.hp = Math.max(0, this.hp - amount);
@@ -744,6 +849,8 @@ export class RivalBot {
 
     if (this.hp <= 0) {
       this.alive = false;
+      this.vx = 0;
+      this.vz = 0;
       this.respawnTimer = CONFIG.RESPAWN_SECONDS;
       this.shieldActive = false;
       this.shieldTimer = 0;
@@ -752,7 +859,7 @@ export class RivalBot {
       this.knockVx = 0;
       this.knockVz = 0;
 
-      // Droppa i SUOI segnalini solo nei dati privati del bot (zero mesh sullo schermo del giocatore)
+      // Droppa solo i segnalini raccolti personalmente da QUESTO bot nel pool rosso (zero mesh al giocatore)
       const count = this.collectedPages.length;
       for (let i = 0; i < count; i++) {
         const held = this.collectedPages[i];
@@ -763,12 +870,13 @@ export class RivalBot {
         bp.x = dropPos.x;
         bp.z = dropPos.z;
         bp.collected = false;
+        bp.collectedBy = null;
       }
       this.collectedPages = [];
       this.currentPath = [];
-      return { blocked: false, died: true };
+      return { blocked: false, died: true, droppedCount: count };
     }
 
-    return { blocked: false, died: false };
+    return { blocked: false, died: false, droppedCount: 0 };
   }
 }
